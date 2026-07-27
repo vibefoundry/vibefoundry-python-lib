@@ -36,6 +36,30 @@ function jsonResponse(obj, status = 200) {
   })
 }
 
+// --- the one place that talks to the host bridge -----------------------------
+// Everything below funnels through here, so the pane has exactly one route to
+// the backend and the shims stay thin.
+async function backendRequest(path, method = 'GET', body) {
+  const api = await awaitOpenai()
+  if (!api) return { status: 503, json: { error: 'host bridge unavailable' } }
+
+  // Build args WITHOUT undefined values — the host rejects undefined params
+  // ("Invalid MCP tool call params").
+  const args = { path, method }
+  if (body !== undefined && body !== null) args.body = body
+
+  try {
+    const res = await api.callTool('vf_request', args)
+    const sc =
+      (res && (res.structuredContent || (res.result && res.result.structuredContent))) ||
+      res ||
+      {}
+    return { status: sc.status || 200, json: sc.json, text: sc.text }
+  } catch (err) {
+    return { status: 502, json: { error: String((err && err.message) || err) } }
+  }
+}
+
 // --- fetch shim: route every /api call through the MCP proxy -----------------
 const origFetch = window.fetch ? window.fetch.bind(window) : null
 
@@ -72,51 +96,102 @@ const shimFetch = async function (input, init) {
     try { body = JSON.parse(body) } catch (e) { /* keep raw string */ }
   }
 
-  const api = await awaitOpenai()
-  if (!api) return jsonResponse({ error: 'host bridge unavailable' }, 503)
-
-  // Build args WITHOUT undefined values — the host rejects undefined params
-  // ("Invalid MCP tool call params").
-  const args = { path, method }
-  if (body !== undefined && body !== null) args.body = body
-
-  try {
-    const res = await api.callTool('vf_request', args)
-    const sc =
-      (res && (res.structuredContent || (res.result && res.result.structuredContent))) ||
-      res ||
-      {}
-    const payload = sc.json != null ? sc.json : (sc.text != null ? sc.text : '')
-    const text = typeof payload === 'string' ? payload : JSON.stringify(payload)
-    return new Response(text, {
-      status: sc.status || 200,
-      headers: { 'Content-Type': 'application/json' },
-    })
-  } catch (err) {
-    return jsonResponse({ error: String((err && err.message) || err) }, 502)
+  // The server answers a profile request with "started, watch the websocket".
+  // Ours is a polling bridge, so notice the request going past and start
+  // watching on the app's behalf. See watchProfile below.
+  if (method === 'POST' && path.split('?')[0] === '/api/dataframe/profile') {
+    const filePath = body && body.filePath
+    if (filePath) watchProfile(filePath)
   }
+
+  const res = await backendRequest(path, method, body)
+  const payload = res.json != null ? res.json : (res.text != null ? res.text : '')
+  const text = typeof payload === 'string' ? payload : JSON.stringify(payload)
+  return new Response(text, {
+    status: res.status,
+    headers: { 'Content-Type': 'application/json' },
+  })
 }
 
 window.fetch = shimFetch
 
-// --- WebSocket shim: inert, never connects, never reconnect-loops ------------
-function InertWebSocket(url) {
+// --- WebSocket shim: a polling bridge, not a dead stub -----------------------
+//
+// The sandbox blocks websockets to localhost, so the app can never receive the
+// events the server pushes. It used to get an inert stub, which meant anything
+// waiting on a pushed event waited forever — the large-file preview modal sat
+// on its spinner indefinitely the first time you opened a big file.
+//
+// Instead: a fake socket that reports OPEN and delivers messages we synthesize
+// by polling. Consumers cannot tell the difference, so App.jsx and the modal
+// work unmodified — which matters, because they are the standalone IDE's code
+// and this file is the only place allowed to know it is running in a pane.
+const paneSockets = new Set()
+
+function PaneSocket(url) {
   this.url = url
-  this.readyState = 0 // CONNECTING forever — no open/close/error events fire
+  this.readyState = 1 // OPEN — never CLOSED, so App.jsx's reconnect never fires
   this.onopen = null
   this.onmessage = null
   this.onclose = null
   this.onerror = null
+  paneSockets.add(this)
+  setTimeout(() => { if (this.onopen) try { this.onopen({}) } catch (e) {} }, 0)
 }
-InertWebSocket.prototype.send = function () {}
-InertWebSocket.prototype.close = function () { this.readyState = 3 }
-InertWebSocket.prototype.addEventListener = function () {}
-InertWebSocket.prototype.removeEventListener = function () {}
-InertWebSocket.CONNECTING = 0
-InertWebSocket.OPEN = 1
-InertWebSocket.CLOSING = 2
-InertWebSocket.CLOSED = 3
-window.WebSocket = InertWebSocket
+PaneSocket.prototype.send = function () {}
+PaneSocket.prototype.close = function () {
+  this.readyState = 3
+  paneSockets.delete(this)
+}
+PaneSocket.prototype.addEventListener = function () {}
+PaneSocket.prototype.removeEventListener = function () {}
+PaneSocket.CONNECTING = 0
+PaneSocket.OPEN = 1
+PaneSocket.CLOSING = 2
+PaneSocket.CLOSED = 3
+window.WebSocket = PaneSocket
+
+/** Deliver a synthesized server message to every live socket. */
+function pushToPane(message) {
+  const data = JSON.stringify(message)
+  paneSockets.forEach((sock) => {
+    if (sock.readyState !== 1 || typeof sock.onmessage !== 'function') return
+    try { sock.onmessage({ data }) } catch (e) { /* a listener threw; keep going */ }
+  })
+}
+
+// One watcher per file, so repeated clicks don't stack pollers.
+const profileWatches = new Set()
+
+/**
+ * Poll a profile to completion and emit the event the server would have pushed.
+ *
+ * No synthetic progress: the modal renders a literal chunk count ("3 / 10
+ * chunks"), and inventing those numbers would put a falsehood on screen. So the
+ * bar sits at zero until the profile lands, then the modal moves on. Profiling
+ * 5M rows takes well under a second, so this is only visible on enormous files.
+ */
+async function watchProfile(filePath) {
+  if (profileWatches.has(filePath)) return
+  profileWatches.add(filePath)
+
+  const deadline = Date.now() + 10 * 60 * 1000
+  try {
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 400))
+      const res = await backendRequest(
+        `/api/dataframe/profile/result?filePath=${encodeURIComponent(filePath)}`
+      )
+      const profile = res && res.json && res.json.profile
+      if (profile && profile.columns) {
+        pushToPane({ type: 'profile_complete', filePath, profile })
+        return
+      }
+    }
+  } finally {
+    profileWatches.delete(filePath)
+  }
+}
 
 // --- Inline = a single launch button; the full IDE mounts only in the pane ---
 const FONT =
