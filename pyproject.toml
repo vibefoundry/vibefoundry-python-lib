@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibefoundry"
-version = "0.2.22"
+version = "0.3.0"
 description = "A local IDE for data science workflows with script running and metadata generation"
 readme = "README.md"
 license = {text = "MIT"}
@@ -56,7 +56,7 @@ vibefoundry = "vibefoundry.cli:main"
 
 [project.urls]
 Homepage = "https://vibefoundry.ai"
-Repository = "https://github.com/vibefoundry/vibefoundry-ide"
+Repository = "https://github.com/vibefoundry/vibefoundry-python-lib"
 
 [tool.setuptools.packages.find]
 where = ["src"]
