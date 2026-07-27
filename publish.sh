@@ -19,14 +19,17 @@ echo "Clearing cache..."
 rm -rf dist build src/vibefoundry.egg-info
 
 echo "Clearing static files..."
-rm -rf src/vibefoundry/static/*
+rm -rf src/vibefoundry/static/* src/vibefoundry/pane/*
 
-# npm install and build frontend
+# npm install and build both frontend targets: the standalone app (static/) and
+# the single-file pane bundle (pane/) that host MCP servers serve as a widget.
 echo "Installing frontend dependencies..."
 cd frontend
 npm install
 echo "Building frontend..."
 npm run build
+echo "Building pane bundle..."
+npm run build:pane
 cd ..
 
 # Build Python package

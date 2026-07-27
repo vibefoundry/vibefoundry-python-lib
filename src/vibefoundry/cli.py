@@ -82,8 +82,23 @@ def main(args: Optional[list[str]] = None):
         action="store_true",
         help="Run in development mode (enables CORS, detailed logging)"
     )
+    parser.add_argument(
+        "--pane-path",
+        action="store_true",
+        help="Print the path to the bundled pane HTML and exit. How an MCP "
+             "server locates the pane without hardcoding install layouts."
+    )
 
     parsed_args = parser.parse_args(args)
+
+    # Resolve-and-exit: no server, no project folder needed.
+    if parsed_args.pane_path:
+        pane = Path(__file__).parent / "pane" / "index.pane.html"
+        if not pane.exists():
+            print(f"Error: pane bundle missing at {pane}", file=sys.stderr)
+            return 1
+        print(pane)
+        return 0
 
     # Handle project folder - use current directory if not specified
     if parsed_args.folder:

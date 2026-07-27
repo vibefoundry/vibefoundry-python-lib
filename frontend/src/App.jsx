@@ -18,6 +18,19 @@ function App() {
   const [showSignedInModal, setShowSignedInModal] = useState(false)
   const [appVersion, setAppVersion] = useState('')
 
+  // True when running EMBEDDED in a host pane rather than as the standalone app.
+  // Three host-neutral signals, any of which flips pane mode:
+  //   - window.openai       -> Codex / ChatGPT desktop-app widget
+  //   - framed (self!=top)  -> Claude Code preview (and any iframe embed)
+  //   - ?pane=1             -> explicit override for testing / custom launches
+  // Nothing else is needed to make a host feel native: the theme is already
+  // neutral for everyone. This only hides chrome that cannot work in a pane.
+  const isPane = typeof window !== 'undefined' && (
+    !!window.openai ||
+    window.self !== window.top ||
+    new URLSearchParams(window.location.search).get('pane') === '1'
+  )
+
   // Read the version off the backend rather than hardcoding it here, so the
   // footer can't drift from the installed package the way it did before.
   useEffect(() => {
@@ -864,6 +877,10 @@ function App() {
             </div>
           </div>
           <div className="top-bar-section top-bar-right">
+            {/* These shell out to a NATIVE terminal window on the user's desktop.
+                Inside a host pane that window would open behind the app with no
+                way back to it, so hide them there rather than ship a dead button. */}
+            {!isPane && (<>
             <button
               className="btn-flat"
               onClick={async () => {
@@ -928,6 +945,7 @@ function App() {
             >
               Gemini
             </button>
+            </>)}
             <button className="btn-flat btn-auth" onClick={handleAuthToggle}>
               {isSignedIn ? 'Sign out' : 'Sign in'}
             </button>

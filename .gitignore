@@ -43,3 +43,4 @@ Thumbs.db
 # Build artifacts
 frontend/dist/
 src/vibefoundry/static/
+src/vibefoundry/pane/
