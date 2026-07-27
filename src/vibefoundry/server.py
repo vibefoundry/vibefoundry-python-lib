@@ -16,6 +16,10 @@ import time
 import urllib.parse
 from pathlib import Path
 
+# Safe despite __init__ importing cli: __version__ is bound before that import,
+# so a partially-initialized package still resolves it.
+from vibefoundry import __version__
+
 # Honor the OS-native trust store (Windows cert store, macOS Keychain) so
 # corporate TLS-inspecting proxies — which re-sign traffic with an internal
 # CA that lives only in the OS store, not certifi — don't break HTTPS calls
@@ -395,7 +399,7 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app
 app = FastAPI(
     title="VibeFoundry IDE",
-    version="0.1.0",
+    version=__version__,
     lifespan=lifespan
 )
 
@@ -419,7 +423,11 @@ def get_static_dir() -> Path:
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "ok", "project_folder": str(state.project_folder) if state.project_folder else None}
+    return {
+        "status": "ok",
+        "version": __version__,
+        "project_folder": str(state.project_folder) if state.project_folder else None,
+    }
 
 
 class LaunchTerminalRequest(BaseModel):

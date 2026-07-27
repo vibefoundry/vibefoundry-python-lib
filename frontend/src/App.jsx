@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import FileTree from './components/FileTree'
 import FileViewer from './components/FileViewer'
-import ScriptRunner from './components/ScriptRunner'
 import FolderPicker from './components/FolderPicker'
 import TemplatePickerModal from './components/TemplatePickerModal'
 import {
@@ -17,6 +16,18 @@ function App() {
   // confirmation moment before the IDE renders. Triggered by the
   // localStorage 'vf_signin_pending' flag set when startSignIn runs.
   const [showSignedInModal, setShowSignedInModal] = useState(false)
+  const [appVersion, setAppVersion] = useState('')
+
+  // Read the version off the backend rather than hardcoding it here, so the
+  // footer can't drift from the installed package the way it did before.
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/health')
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => { if (data?.version && !cancelled) setAppVersion(data.version) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
 
   // Poll auth status every 2s so when the browser sign-in flow completes
   // and writes the token to disk, the IDE picks it up automatically.
@@ -92,9 +103,6 @@ function App() {
   const [deletedFileToast, setDeletedFileToast] = useState(null)
   const [showFolderPicker, setShowFolderPicker] = useState(true)
   const [projectPath, setProjectPath] = useState(null)
-  const [scriptRunnerHeight, setScriptRunnerHeight] = useState(null)
-  const [isResizingScriptRunner, setIsResizingScriptRunner] = useState(false)
-  const [scriptChangeEvent, setScriptChangeEvent] = useState(null)
   const [showNewFolderModal, setShowNewFolderModal] = useState(false)
   const [newFolderName, setNewFolderName] = useState('')
   const [creatingFolder, setCreatingFolder] = useState(false)
@@ -154,53 +162,6 @@ function App() {
     handle.addEventListener('pointerup', onEnd)
     handle.addEventListener('pointercancel', onEnd)
   }, [])
-
-  // Script runner resize handler
-  const isResizingScriptRunnerRef = useRef(false)
-
-  const handleScriptRunnerResizeStart = useCallback((e) => {
-    e.preventDefault()
-    const handle = e.currentTarget
-    const pointerId = e.pointerId
-    try { handle.setPointerCapture(pointerId) } catch {}
-    isResizingScriptRunnerRef.current = true
-    setIsResizingScriptRunner(true)
-    document.body.style.cursor = 'ns-resize'
-    document.body.style.userSelect = 'none'
-
-    const startY = e.clientY
-    const startHeight = scriptRunnerHeight || (mainContentRef.current?.clientHeight / 4) || 200
-
-    const onMove = (ev) => {
-      if (!isResizingScriptRunnerRef.current) return
-      ev.preventDefault()
-      const deltaY = startY - ev.clientY
-      const newHeight = Math.max(100, Math.min(600, startHeight + deltaY))
-      setScriptRunnerHeight(newHeight)
-    }
-
-    const onEnd = () => {
-      isResizingScriptRunnerRef.current = false
-      setIsResizingScriptRunner(false)
-      document.body.style.cursor = ''
-      document.body.style.userSelect = ''
-      try { handle.releasePointerCapture(pointerId) } catch {}
-      handle.removeEventListener('pointermove', onMove)
-      handle.removeEventListener('pointerup', onEnd)
-      handle.removeEventListener('pointercancel', onEnd)
-    }
-
-    handle.addEventListener('pointermove', onMove)
-    handle.addEventListener('pointerup', onEnd)
-    handle.addEventListener('pointercancel', onEnd)
-  }, [scriptRunnerHeight])
-
-  // Initialize script runner height to 1/4 of main content
-  useEffect(() => {
-    if (mainContentRef.current && scriptRunnerHeight === null) {
-      setScriptRunnerHeight(mainContentRef.current.clientHeight / 4)
-    }
-  }, [tree, scriptRunnerHeight])
 
   // Helper to get a hash of the tree structure including modification times
   const getTreeHash = (nodes) => {
@@ -370,9 +331,6 @@ function App() {
                 loadOutputFile(bestFile)
               }, 1000) // Wait 1 second for things to settle
             }
-          } else if (data.type === 'script_change' && data.path) {
-            // Forward script changes to ScriptRunner via state
-            setScriptChangeEvent({ path: data.path, timestamp: Date.now() })
           }
         } catch (e) {
           // Ignore parse errors for keepalive messages
@@ -807,11 +765,7 @@ function App() {
     }
   }
 
-  const activeResizeCursor = isResizing
-    ? 'col-resize'
-    : isResizingScriptRunner
-      ? 'ns-resize'
-      : null
+  const activeResizeCursor = isResizing ? 'col-resize' : null
 
   const renderSignInGate = () => (
     <div className="signin-screen">
@@ -1100,21 +1054,6 @@ function App() {
               </div>
             </div>
           )}
-
-          {/* Script Runner Panel */}
-          {canWrite && tree.length > 0 && (
-            <>
-              <div
-                className="script-runner-resize-handle"
-                onPointerDown={handleScriptRunnerResizeStart}
-              />
-              <ScriptRunner
-                folderName={folderName}
-                height={scriptRunnerHeight}
-                scriptChangeEvent={scriptChangeEvent}
-              />
-            </>
-          )}
         </div>
 
       </div>
@@ -1258,7 +1197,9 @@ function App() {
       {/* Bottom Bar */}
       {canWrite && tree.length > 0 && (
         <div className="bottom-bar">
-          <span className="bottom-bar-text">VibeFoundry IDE v0.1.38</span>
+          <span className="bottom-bar-text">
+            VibeFoundry IDE{appVersion ? ` v${appVersion}` : ''}
+          </span>
         </div>
       )}
 
