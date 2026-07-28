@@ -132,12 +132,23 @@ def _series_from(ser, workbook) -> dict:
     tx = _first_local(ser, "tx")
     name = ""
     if tx is not None:
+        # Three ways a series name is stored, all seen in the wild:
+        #   <tx><strRef><strCache><pt><v>   cached (Excel)
+        #   <tx><strRef><f>                 a cell reference (openpyxl)
+        #   <tx><v>                         the name inline (xlsxwriter)
         cached, ok = _cached(tx)
         name = str(cached[0]) if ok and cached and cached[0] is not None else ""
         if not name:
             f = _ref_formula(tx)
             resolved = _resolve(workbook, f)
-            name = str(resolved[0]) if resolved and resolved[0] is not None else (f or "")
+            name = str(resolved[0]) if resolved and resolved[0] is not None else ""
+        if not name:
+            # A <v> sitting directly under <tx>, rather than inside a cache.
+            direct = next((v for v in tx if _local(v.tag) == "v"), None)
+            if direct is not None and direct.text:
+                name = direct.text.strip()
+        if not name:
+            name = _ref_formula(tx) or ""
 
     # scatter uses yVal; everything else uses val
     holder = _first_local(ser, "val") or _first_local(ser, "yVal")
@@ -184,7 +195,14 @@ def extract_charts(path: Path, workbook=None) -> list[dict]:
         return charts
 
     with zf:
-        parts = sorted(n for n in zf.namelist() if re.match(r"xl/charts/chart\d+\.xml$", n))
+        # Writers disagree about where chart parts live: openpyxl and Excel use
+        # xl/charts/chartN.xml, xlsxwriter uses xl/drawings/charts/chartN.xml.
+        # Match either — looking in only one place silently loses every chart in
+        # files from the other, which is exactly how this was first found.
+        parts = sorted(
+            n for n in zf.namelist()
+            if re.match(r"^xl/(?:\w+/)*charts?/chart\d+\.xml$", n)
+        )
         for part in parts:
             try:
                 root = ET.fromstring(zf.read(part))
@@ -232,6 +250,42 @@ def extract_charts(path: Path, workbook=None) -> list[dict]:
     return charts
 
 
+_LITERAL_CURRENCY = re.compile(r'"([$£€¥])"')
+_WHITE_TEXT = re.compile(r'style="([^"]*)"')
+
+
+def _clean_html(html: str) -> str:
+    """Repair two things the cell renderer gets wrong on real workbooks.
+
+    1. Excel number formats quote literal text — `"$"#,##0` means a dollar sign
+       followed by a number. Those quotes are delimiters, not characters, but
+       they arrive rendered, so currency reads as `"$"42,000`.
+
+    2. A header styled white-on-a-theme-fill comes through as white text with no
+       background, because theme colours aren't resolved — leaving the row
+       invisible against the page. Rather than guess the intended fill, darken
+       text that would otherwise be unreadable. Losing the intended colour is a
+       far smaller failure than losing the words.
+    """
+    html = _LITERAL_CURRENCY.sub(r"\1", html)
+
+    def fix_style(m: "re.Match") -> str:
+        style = m.group(1)
+        if "background-color" in style:
+            return m.group(0)  # it has a fill; white text is legible on it
+        # #fff / #ffffff / #FFFFFFFF, with or without an alpha pair
+        if re.search(r"color:\s*#(?:fff|ffff|ffffff|ffffffff)\b", style, re.IGNORECASE):
+            style = re.sub(
+                r"color:\s*#(?:fff|ffff|ffffff|ffffffff)\b",
+                "color: #0d0d0d",
+                style,
+                flags=re.IGNORECASE,
+            )
+        return f'style="{style}"'
+
+    return _WHITE_TEXT.sub(fix_style, html)
+
+
 def sheet_names(path: Path) -> list[str]:
     try:
         from openpyxl import load_workbook
@@ -260,7 +314,7 @@ def render(path: Path, sheet: Optional[str] = None) -> Optional[dict]:
         buf = io.StringIO()
         # append_headers/append_lineno draw Excel's A/B/C and 1/2/3 gutters.
         xlsx2html(str(path), buf, sheet=active)
-        html = buf.getvalue()
+        html = _clean_html(buf.getvalue())
     except Exception:
         return None
 
