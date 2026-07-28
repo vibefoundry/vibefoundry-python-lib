@@ -1061,6 +1061,19 @@ function App() {
                 setFileContent(null)
                 setSelectedFile(null)
               }}
+              onShowData={async () => {
+                // Re-read the same file with the faithful render suppressed, to
+                // get the sortable/scrollable data view of a spreadsheet.
+                if (!selectedFile) return
+                try {
+                  const res = await fetch(
+                    `/api/files/read?path=${encodeURIComponent(selectedFile.path)}&asData=1`
+                  )
+                  if (res.ok) setFileContent(await res.json())
+                } catch (err) {
+                  console.error('Failed to load data view:', err)
+                }
+              }}
             />
           ) : (
             <div className="placeholder">

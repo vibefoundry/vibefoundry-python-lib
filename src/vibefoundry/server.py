@@ -19,6 +19,7 @@ from pathlib import Path
 # Safe despite __init__ importing cli: __version__ is bound before that import,
 # so a partially-initialized package still resolves it.
 from vibefoundry import __version__
+from vibefoundry import office
 
 # Honor the OS-native trust store (Windows cert store, macOS Keychain) so
 # corporate TLS-inspecting proxies — which re-sign traffic with an internal
@@ -1379,7 +1380,7 @@ async def get_file_tree():
 
 
 @app.get("/api/files/read")
-async def read_file(path: str, sheet: Optional[str] = None):
+async def read_file(path: str, sheet: Optional[str] = None, asData: bool = False):
     """Read a file's content - streams from disk, doesn't hold data in memory"""
     if not state.project_folder:
         raise HTTPException(status_code=400, detail="No project folder selected")
@@ -1407,6 +1408,27 @@ async def read_file(path: str, sheet: Optional[str] = None):
     ext = file_path.suffix.lower()
     binary_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.pdf', '.zip', '.tar', '.gz'}
     dataframe_extensions = {'.csv', '.xlsx', '.xls', '.parquet', '.geoparquet'}
+
+    # Office formats render faithfully — charts, fills, merged cells — when
+    # LibreOffice is present. Parsing a spreadsheet into a dataframe throws all
+    # of that away, so prefer the render and keep the dataframe path as the
+    # fallback for when LibreOffice is missing or the file is too large.
+    if office.can_render(file_path) and not asData:
+        return {
+            "type": "office",
+            "format": office.target_format(file_path),
+            "filename": file_path.name,
+            "path": str(file_path.relative_to(state.project_folder)),
+            # Offered for spreadsheets only: the rendered view is a picture, so
+            # sorting and scrolling 100k rows still needs the data view.
+            "hasDataView": ext in dataframe_extensions,
+        }
+
+    if ext in office.SPREADSHEET_EXTS | office.DOCUMENT_EXTS and not office.available():
+        # Spreadsheets still have a usable data view; presentations have nothing
+        # to fall back to, so say plainly what is missing.
+        if ext not in dataframe_extensions:
+            return {"type": "unknown", "message": office.install_hint(), "filename": file_path.name}
 
     if ext in dataframe_extensions:
         print(f"[File Read] Parsing dataframe: {path}")
@@ -1785,6 +1807,39 @@ async def get_image(path: str):
 
     media_type = media_types.get(ext, 'application/octet-stream')
     return FileResponse(file_path, media_type=media_type)
+
+
+@app.get("/api/office/render")
+async def render_office(path: str):
+    """Render a spreadsheet or presentation as LibreOffice draws it.
+
+    Spreadsheets come back as one self-contained HTML document — charts inlined
+    as data: URIs — so the client can drop it straight into an iframe with no
+    second request for assets. Presentations come back as a PDF, where pages are
+    slides. First render costs ~2s; afterwards it is served from cache.
+    """
+    if not state.project_folder:
+        raise HTTPException(status_code=400, detail="No project folder selected")
+
+    file_path = state.project_folder / path
+    try:
+        file_path.resolve().relative_to(state.project_folder.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if not office.available():
+        raise HTTPException(status_code=503, detail=office.install_hint())
+
+    result = await asyncio.to_thread(office.render, file_path)
+    if result is None:
+        raise HTTPException(status_code=500, detail="LibreOffice could not render this file.")
+
+    fmt, payload = result
+    if fmt == "html":
+        return Response(content=payload, media_type="text/html; charset=utf-8")
+    return Response(content=payload, media_type="application/pdf")
 
 
 @app.get("/api/pdf")
