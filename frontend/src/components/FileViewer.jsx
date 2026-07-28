@@ -3,7 +3,6 @@ import LargeFilePreviewModal from './LargeFilePreviewModal'
 import JsonViewer from './JsonViewer'
 import CodeViewer from './CodeViewer'
 import MarkdownViewer from './MarkdownViewer'
-import OfficeViewer from './OfficeViewer'
 
 const PdfViewer = ({ content }) => (
   <div className="pdf-viewer">
@@ -47,7 +46,7 @@ const DocxViewer = ({ content }) => {
   )
 }
 
-const FileViewer = ({ content, canWrite, onSave, onSheetChange, saveStatus, onLargeFilePreviewReady, onLargeFileCancel, onShowData }) => {
+const FileViewer = ({ content, canWrite, onSave, onSheetChange, saveStatus, onLargeFilePreviewReady, onLargeFileCancel }) => {
   if (!content) return null
 
   const renderViewer = () => {
@@ -62,8 +61,6 @@ const FileViewer = ({ content, canWrite, onSave, onSheetChange, saveStatus, onLa
         )
       case 'dataframe':
         return <DataFrameViewer content={content} onSheetChange={onSheetChange} />
-      case 'office':
-        return <OfficeViewer content={content} onShowData={onShowData} />
       case 'docx':
         return <DocxViewer content={content} />
       case 'image':
