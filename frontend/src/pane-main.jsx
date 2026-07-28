@@ -67,6 +67,21 @@ async function backendRequest(path, method = 'GET', body, multipart) {
   }
 }
 
+// The folder the backend was launched against. Asked for once and remembered:
+// it cannot change for the life of a backend, and the picker asks on every open.
+let projectFolderPromise = null
+function projectFolder() {
+  if (!projectFolderPromise) {
+    projectFolderPromise = backendRequest('/api/health')
+      .then((r) => (r && r.json && r.json.project_folder) || null)
+      .catch(() => null)
+      // Don't cache a failure — a transient error would otherwise disable this
+      // for the whole session.
+      .then((v) => { if (!v) projectFolderPromise = null; return v })
+  }
+  return projectFolderPromise
+}
+
 const readAsBase64 = (file) =>
   new Promise((resolve) => {
     const reader = new FileReader()
@@ -118,6 +133,20 @@ const shimFetch = async function (input, init) {
   // poll rather than let the IDE sit on its sign-in gate forever.
   if (url.startsWith('/api/auth/status')) {
     return jsonResponse({ signedIn: true })
+  }
+
+  // The folder picker opens wherever /api/fs/home points. In a pane the folder
+  // was already chosen — it's the directory the host launched us against — so
+  // answer with that instead of the real home directory, and the picker opens
+  // in the project rather than making the user navigate back to it.
+  //
+  // Only an answer to "where should I start browsing"; every other picker call
+  // (list, new folder, select) still goes to the backend untouched, so nothing
+  // is trapped in the project folder if they want to browse elsewhere.
+  if (url.split('?')[0].endsWith('/api/fs/home')) {
+    const folder = await projectFolder()
+    if (folder) return jsonResponse({ path: folder })
+    // No folder known — fall through and let the backend answer normally.
   }
 
   // Normalize to a backend-relative path (drop any absolute origin prefix).
