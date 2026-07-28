@@ -39,14 +39,15 @@ function jsonResponse(obj, status = 200) {
 // --- the one place that talks to the host bridge -----------------------------
 // Everything below funnels through here, so the pane has exactly one route to
 // the backend and the shims stay thin.
-async function backendRequest(path, method = 'GET', body) {
+async function backendRequest(path, method = 'GET', body, multipart) {
   const api = await awaitOpenai()
   if (!api) return { status: 503, json: { error: 'host bridge unavailable' } }
 
   // Build args WITHOUT undefined values — the host rejects undefined params
   // ("Invalid MCP tool call params").
   const args = { path, method }
-  if (body !== undefined && body !== null) args.body = body
+  if (multipart !== undefined) args.multipart = multipart
+  else if (body !== undefined && body !== null) args.body = body
 
   try {
     const res = await api.callTool('vf_request', args)
@@ -54,10 +55,48 @@ async function backendRequest(path, method = 'GET', body) {
       (res && (res.structuredContent || (res.result && res.result.structuredContent))) ||
       res ||
       {}
-    return { status: sc.status || 200, json: sc.json, text: sc.text }
+    return {
+      status: sc.status || 200,
+      json: sc.json,
+      text: sc.text,
+      base64: sc.base64,
+      contentType: sc.contentType,
+    }
   } catch (err) {
     return { status: 502, json: { error: String((err && err.message) || err) } }
   }
+}
+
+const readAsBase64 = (file) =>
+  new Promise((resolve) => {
+    const reader = new FileReader()
+    // result is "data:<type>;base64,<payload>" — we only want the payload.
+    reader.onload = () => resolve(String(reader.result).split(',')[1] || '')
+    reader.onerror = () => resolve('')
+    reader.readAsDataURL(file)
+  })
+
+/**
+ * Flatten a FormData into parts the relay can rebuild into a real multipart
+ * body. FormData cannot cross a JSON-RPC boundary, which is why "Add data"
+ * silently did nothing in a pane: the upload was handed to the host as an
+ * unserializable object and never reached the backend.
+ */
+async function formDataToParts(fd) {
+  const parts = []
+  for (const [name, value] of fd.entries()) {
+    if (value instanceof File || value instanceof Blob) {
+      parts.push({
+        name,
+        filename: value.name || 'upload',
+        contentType: value.type || 'application/octet-stream',
+        base64: await readAsBase64(value),
+      })
+    } else {
+      parts.push({ name, value: String(value) })
+    }
+  }
+  return parts
 }
 
 // --- fetch shim: route every /api call through the MCP proxy -----------------
@@ -92,7 +131,11 @@ const shimFetch = async function (input, init) {
   ).toUpperCase()
 
   let body = init.body
-  if (typeof body === 'string') {
+  let multipart
+  if (typeof FormData !== 'undefined' && body instanceof FormData) {
+    multipart = await formDataToParts(body)
+    body = undefined
+  } else if (typeof body === 'string') {
     try { body = JSON.parse(body) } catch (e) { /* keep raw string */ }
   }
 
@@ -104,7 +147,18 @@ const shimFetch = async function (input, init) {
     if (filePath) watchProfile(filePath)
   }
 
-  const res = await backendRequest(path, method, body)
+  const res = await backendRequest(path, method, body, multipart)
+
+  // Binary comes back base64'd; hand callers a real Blob-backed Response so
+  // res.blob() / res.arrayBuffer() behave normally.
+  if (res.base64 != null) {
+    const bytes = Uint8Array.from(atob(res.base64), (c) => c.charCodeAt(0))
+    return new Response(bytes, {
+      status: res.status,
+      headers: { 'Content-Type': res.contentType || 'application/octet-stream' },
+    })
+  }
+
   const payload = res.json != null ? res.json : (res.text != null ? res.text : '')
   const text = typeof payload === 'string' ? payload : JSON.stringify(payload)
   return new Response(text, {
@@ -191,6 +245,56 @@ async function watchProfile(filePath) {
   } finally {
     profileWatches.delete(filePath)
   }
+}
+
+// --- <img src="/api/..."> -> data: URL ---------------------------------------
+//
+// The IDE renders images with a plain <img src="/api/image?path=...">. A fetch
+// shim cannot intercept that: the browser loads it directly, and inside the
+// sandbox that relative URL resolves against the widget's origin rather than the
+// backend, so it never arrives — images just came up blank.
+//
+// So watch the DOM instead: whenever an <img> appears pointing at the backend,
+// pull the bytes through the relay and swap in a data: URL. Untouched app code,
+// working images.
+const imageCache = new Map()
+
+async function resolveImage(img) {
+  const src = img.getAttribute('src') || ''
+  if (!src.startsWith('/api/')) return
+  if (img.dataset.vfResolved === src) return
+  img.dataset.vfResolved = src
+
+  if (imageCache.has(src)) {
+    img.src = imageCache.get(src)
+    return
+  }
+  const res = await backendRequest(src, 'GET')
+  if (res.base64 == null) return // an error body; leave the element alone
+  const url = `data:${res.contentType || 'image/png'};base64,${res.base64}`
+  imageCache.set(src, url)
+  // Re-check: React may have pointed this element somewhere else while we waited.
+  if (img.getAttribute('src') === src) img.src = url
+}
+
+function sweepImages(root) {
+  if (!root || !root.querySelectorAll) return
+  if (root.tagName === 'IMG') resolveImage(root)
+  root.querySelectorAll('img[src^="/api/"]').forEach(resolveImage)
+}
+
+if (typeof MutationObserver !== 'undefined') {
+  new MutationObserver((records) => {
+    records.forEach((rec) => {
+      if (rec.type === 'attributes') sweepImages(rec.target)
+      else rec.addedNodes.forEach(sweepImages)
+    })
+  }).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['src'],
+  })
 }
 
 // --- Inline = a single launch button; the full IDE mounts only in the pane ---
