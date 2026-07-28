@@ -1515,6 +1515,122 @@ body {
   border: none;
 }
 
+/* Spreadsheet shown as it looks — styled cells plus redrawn charts */
+.sheet-viewer {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--color-bg);
+}
+
+.sheet-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-alt);
+  flex-shrink: 0;
+}
+
+.sheet-filename {
+  font-size: var(--font-size-small);
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sheet-scroll {
+  flex: 1;
+  overflow: auto;
+  padding: 16px;
+  /* The workbook's own fills assume a white page; keep it white so they read
+     the way they do in a spreadsheet rather than against the app chrome. */
+  background: #ffffff;
+}
+
+/* The injected table carries its own inline styles from the workbook. Only
+   supply what it cannot: crisp gridlines and a sane default font. */
+.sheet-grid table {
+  border-collapse: collapse;
+  font-size: 13px;
+  font-family: var(--font-main);
+}
+
+.sheet-grid td,
+.sheet-grid th {
+  border: 1px solid #e2e2e2;
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+
+.sheet-grid table tr:first-child td,
+.sheet-grid th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.sheet-chart {
+  margin: 24px 0 8px;
+  padding: 12px;
+  height: 320px;
+  max-width: 720px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.sheet-chart-unsupported {
+  height: auto;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.sheet-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 8px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg-alt);
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.sheet-tab {
+  padding: 6px 14px;
+  font-size: var(--font-size-small);
+  font-family: var(--font-main);
+  color: var(--color-text-muted);
+  background: transparent;
+  border: none;
+  border-top: 2px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.sheet-tab:hover { color: var(--color-text); }
+
+.sheet-tab.active {
+  color: var(--color-text);
+  background: var(--color-bg);
+  border-top-color: var(--color-accent);
+  font-weight: 600;
+}
+
+.sheet-message {
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--color-text-muted);
+}
+
+.sheet-error { max-width: 460px; text-align: center; line-height: 1.5; }
+
 /* Unknown file type */
 .unknown-viewer {
   display: flex;

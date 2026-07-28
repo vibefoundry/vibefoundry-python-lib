@@ -19,6 +19,7 @@ from pathlib import Path
 # Safe despite __init__ importing cli: __version__ is bound before that import,
 # so a partially-initialized package still resolves it.
 from vibefoundry import __version__
+from vibefoundry import xlsx_view
 
 # Honor the OS-native trust store (Windows cert store, macOS Keychain) so
 # corporate TLS-inspecting proxies — which re-sign traffic with an internal
@@ -1379,7 +1380,7 @@ async def get_file_tree():
 
 
 @app.get("/api/files/read")
-async def read_file(path: str, sheet: Optional[str] = None):
+async def read_file(path: str, sheet: Optional[str] = None, asData: bool = False):
     """Read a file's content - streams from disk, doesn't hold data in memory"""
     if not state.project_folder:
         raise HTTPException(status_code=400, detail="No project folder selected")
@@ -1407,6 +1408,17 @@ async def read_file(path: str, sheet: Optional[str] = None):
     ext = file_path.suffix.lower()
     binary_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.pdf', '.zip', '.tar', '.gz'}
     dataframe_extensions = {'.csv', '.xlsx', '.xls', '.parquet', '.geoparquet'}
+
+    # Spreadsheets get shown as they look — styled cells and charts — rather
+    # than flattened into a dataframe, which discards everything that makes a
+    # spreadsheet a spreadsheet. asData=1 opts back into the grid for sorting
+    # and scrolling large sheets.
+    if ext in {'.xlsx', '.xlsm'} and not asData:
+        return {
+            "type": "spreadsheet",
+            "filename": file_path.name,
+            "path": str(file_path.relative_to(state.project_folder)),
+        }
 
     if ext in dataframe_extensions:
         print(f"[File Read] Parsing dataframe: {path}")
@@ -1785,6 +1797,32 @@ async def get_image(path: str):
 
     media_type = media_types.get(ext, 'application/octet-stream')
     return FileResponse(file_path, media_type=media_type)
+
+
+@app.get("/api/spreadsheet")
+async def get_spreadsheet(path: str, sheet: Optional[str] = None):
+    """A spreadsheet reconstructed as it looks: styled cells, plus its charts.
+
+    Returns {html, sheets, activeSheet, charts}. The html carries real fills,
+    fonts, borders and merges; each chart is a definition read out of the
+    workbook for the client to draw. Nothing here shells out — this is the path
+    that works on a machine where no office suite can be installed.
+    """
+    if not state.project_folder:
+        raise HTTPException(status_code=400, detail="No project folder selected")
+
+    file_path = state.project_folder / path
+    try:
+        file_path.resolve().relative_to(state.project_folder.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    result = await asyncio.to_thread(xlsx_view.render, file_path, sheet)
+    if result is None:
+        raise HTTPException(status_code=500, detail="Could not read this spreadsheet.")
+    return result
 
 
 @app.get("/api/pdf")

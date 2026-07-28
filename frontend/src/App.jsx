@@ -461,6 +461,12 @@ function App() {
             sheetNames: data.sheetNames || null,
             activeSheet: data.activeSheet || null
           })
+        } else if (data.type === 'spreadsheet') {
+          setFileContent({
+            type: 'spreadsheet',
+            path: data.path,
+            filename: data.filename
+          })
         } else if (data.type === 'docx') {
           setFileContent({
             type: 'docx',
@@ -1060,6 +1066,19 @@ function App() {
               onLargeFileCancel={() => {
                 setFileContent(null)
                 setSelectedFile(null)
+              }}
+              onShowData={async () => {
+                // Re-read with the styled view suppressed, to get the sortable,
+                // virtualized grid for working with the numbers.
+                if (!selectedFile) return
+                try {
+                  const res = await fetch(
+                    `/api/files/read?path=${encodeURIComponent(selectedFile.path)}&asData=1`
+                  )
+                  if (res.ok) setFileContent(await res.json())
+                } catch (err) {
+                  console.error('Failed to load data view:', err)
+                }
               }}
             />
           ) : (

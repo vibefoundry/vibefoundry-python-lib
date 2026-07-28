@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibefoundry"
-version = "0.3.6"
+version = "0.3.7"
 description = "A local IDE for data science workflows with script running and metadata generation"
 readme = "README.md"
 license = {text = "MIT"}
@@ -39,6 +39,9 @@ dependencies = [
     # polars.read_excel needs a reader backend; without it every .xlsx failed
     # to open with "required package 'fastexcel' not found".
     "fastexcel>=0.10",
+    # Renders a worksheet to HTML keeping fills, fonts, borders and merges —
+    # the styling a dataframe view discards.
+    "xlsx2html>=0.6",
     "websockets>=11.0.0",
     "httpx>=0.25.0",
     "xlsx2csv>=0.8.0",
