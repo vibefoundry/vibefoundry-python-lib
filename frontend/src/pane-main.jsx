@@ -39,14 +39,15 @@ function jsonResponse(obj, status = 200) {
 // --- the one place that talks to the host bridge -----------------------------
 // Everything below funnels through here, so the pane has exactly one route to
 // the backend and the shims stay thin.
-async function backendRequest(path, method = 'GET', body, multipart) {
+async function backendRequest(path, method = 'GET', body, multipart, upload) {
   const api = await awaitOpenai()
   if (!api) return { status: 503, json: { error: 'host bridge unavailable' } }
 
   // Build args WITHOUT undefined values — the host rejects undefined params
   // ("Invalid MCP tool call params").
   const args = { path, method }
-  if (multipart !== undefined) args.multipart = multipart
+  if (upload !== undefined) args.upload = upload
+  else if (multipart !== undefined) args.multipart = multipart
   else if (body !== undefined && body !== null) args.body = body
 
   try {
@@ -97,6 +98,40 @@ const readAsBase64 = (file) =>
  * silently did nothing in a pane: the upload was handed to the host as an
  * unserializable object and never reached the backend.
  */
+// Binary per chunk. Base64 inflates by 4/3, so this puts roughly 340KB on the
+// wire per message — small enough that no single host-bridge call is large.
+const UPLOAD_CHUNK_BYTES = 256 * 1024
+
+let uploadSeq = 0
+
+/**
+ * Stream one file to the relay in pieces, returning the id to reference it by.
+ *
+ * Sending a whole file as one base64 string is what crashed the desktop app:
+ * a multi-megabyte string handed to callTool becomes a single enormous JSON
+ * value crossing the host bridge, and a large enough one aborts V8 and takes
+ * the app down. Chunking keeps every message small no matter the file size.
+ */
+async function streamUpload(blob, onProgress) {
+  const id = `u${Date.now().toString(36)}-${uploadSeq++}`
+  try {
+    for (let offset = 0; offset < blob.size; offset += UPLOAD_CHUNK_BYTES) {
+      const slice = blob.slice(offset, Math.min(offset + UPLOAD_CHUNK_BYTES, blob.size))
+      const base64 = await readAsBase64(slice)
+      const res = await backendRequest('/upload', 'POST', undefined, undefined, { id, base64 })
+      if (res.status >= 400) {
+        throw new Error((res.json && res.json.error) || 'upload failed')
+      }
+      if (onProgress) onProgress(Math.min(offset + UPLOAD_CHUNK_BYTES, blob.size), blob.size)
+    }
+  } catch (err) {
+    // Don't leave a half-built file buffered in the relay.
+    await backendRequest('/upload', 'POST', undefined, undefined, { id, abort: true }).catch(() => {})
+    throw err
+  }
+  return id
+}
+
 async function formDataToParts(fd) {
   const parts = []
   for (const [name, value] of fd.entries()) {
@@ -105,7 +140,7 @@ async function formDataToParts(fd) {
         name,
         filename: value.name || 'upload',
         contentType: value.type || 'application/octet-stream',
-        base64: await readAsBase64(value),
+        uploadId: await streamUpload(value),
       })
     } else {
       parts.push({ name, value: String(value) })
