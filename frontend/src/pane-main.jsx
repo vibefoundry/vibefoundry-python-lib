@@ -14,6 +14,9 @@
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.jsx'
+import { record, installErrorCapture } from './utils/diagnostics'
+
+installErrorCapture()
 
 // --- wait for the Apps SDK host bridge ---------------------------------------
 function awaitOpenai(timeoutMs = 8000) {
@@ -41,7 +44,10 @@ function jsonResponse(obj, status = 200) {
 // the backend and the shims stay thin.
 async function backendRequest(path, method = 'GET', body, multipart, upload) {
   const api = await awaitOpenai()
-  if (!api) return { status: 503, json: { error: 'host bridge unavailable' } }
+  if (!api) {
+    record('relay.no_bridge', { path })
+    return { status: 503, json: { error: 'host bridge unavailable' } }
+  }
 
   // Build args WITHOUT undefined values — the host rejects undefined params
   // ("Invalid MCP tool call params").
@@ -50,20 +56,35 @@ async function backendRequest(path, method = 'GET', body, multipart, upload) {
   else if (multipart !== undefined) args.multipart = multipart
   else if (body !== undefined && body !== null) args.body = body
 
+  const startedAt = Date.now()
   try {
     const res = await api.callTool('vf_request', args)
     const sc =
       (res && (res.structuredContent || (res.result && res.result.structuredContent))) ||
       res ||
       {}
+    const status = sc.status || 200
+    // Only failures are logged by default. A working IDE makes hundreds of these
+    // a minute, and a buffer full of successful tree reads would push the one
+    // interesting line out of view — which is the opposite of the point.
+    if (status >= 400) {
+      record('relay.error', {
+        path,
+        method,
+        status,
+        message: (sc.json && (sc.json.error || sc.json.detail)) || sc.text || null,
+        ms: Date.now() - startedAt,
+      })
+    }
     return {
-      status: sc.status || 200,
+      status,
       json: sc.json,
       text: sc.text,
       base64: sc.base64,
       contentType: sc.contentType,
     }
   } catch (err) {
+    record('relay.threw', { path, method, message: String((err && err.message) || err), ms: Date.now() - startedAt })
     return { status: 502, json: { error: String((err && err.message) || err) } }
   }
 }
@@ -157,6 +178,11 @@ const shimFetch = async function (input, init) {
   const url = typeof input === 'string' ? input : (input && input.url) || ''
   const isApi =
     url.startsWith('/api') ||
+    // The relay's own namespace, answered by the MCP server rather than the
+    // backend. It has to be routed like an API call or it would resolve against
+    // the widget origin and never arrive — the Logs panel would show nothing
+    // about the relay, which is the half worth seeing.
+    url.startsWith('/__plugin/') ||
     url.startsWith('http://127.0.0.1') ||
     url.startsWith('http://localhost')
 
@@ -361,10 +387,14 @@ if (typeof MutationObserver !== 'undefined') {
   })
 }
 
-// --- Inline = a single launch button; the full IDE mounts only in the pane ---
-const FONT =
-  'ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'
-
+// --- Mount immediately, expand immediately -----------------------------------
+//
+// There used to be an "Open VibeFoundry" button here that mounted the IDE on
+// click. It was one more step for something with only one outcome — the tool
+// call that rendered this pane already said to open VibeFoundry — and it made
+// the moment the IDE bound to a backend depend on when the user clicked, which
+// is exactly the sort of timing this pane should not have. So: ask for
+// fullscreen on load and mount the app straight away.
 function goFullscreen() {
   try {
     if (window.openai && window.openai.requestDisplayMode) {
@@ -373,61 +403,13 @@ function goFullscreen() {
   } catch (e) { /* host may ignore */ }
 }
 
-function LaunchScreen() {
-  return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        textAlign: 'center',
-        minHeight: '190px',
-        height: '100%',
-        width: '100%',
-        margin: 0,
-        background: '#ffffff',
-        fontFamily: FONT,
-      }}
-    >
-      <button
-        onClick={launch}
-        style={{
-          font: `600 15px ${FONT}`,
-          padding: '13px 24px',
-          background: '#0d0d0d',
-          color: '#fff',
-          border: 'none',
-          borderRadius: '10px',
-          cursor: 'pointer',
-          boxShadow: '0 2px 10px rgba(0,0,0,.12)',
-        }}
-      >
-        Open VibeFoundry
-      </button>
-    </div>
-  )
-}
-
 const root = createRoot(document.getElementById('root'))
-let launched = false
-let currentView = null
 
-// Show the launch button inline; mount the real IDE once the user launches it
-// (or the host expands the widget to fullscreen). Driven by display mode so it
-// stays in sync however the pane is expanded.
-function render() {
-  const mode = (window.openai && window.openai.displayMode) || 'inline'
-  const view = launched || mode === 'fullscreen' ? 'app' : 'launch'
-  if (view === currentView) return
-  currentView = view
-  root.render(view === 'app' ? <App /> : <LaunchScreen />)
-}
+goFullscreen()
+root.render(<App />)
 
-function launch() {
-  launched = true
-  goFullscreen()
-  render()
-}
-
-window.addEventListener('openai:set_globals', render)
-render()
+// The host can expand or collapse the widget after load. Re-ask for fullscreen
+// when it does, so a collapse doesn't strand the IDE in an inline strip.
+window.addEventListener('openai:set_globals', () => {
+  if ((window.openai && window.openai.displayMode) !== 'fullscreen') goFullscreen()
+})

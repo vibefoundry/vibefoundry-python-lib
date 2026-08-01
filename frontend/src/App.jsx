@@ -3,6 +3,8 @@ import FileTree from './components/FileTree'
 import FileViewer from './components/FileViewer'
 import FolderPicker from './components/FolderPicker'
 import TemplatePickerModal from './components/TemplatePickerModal'
+import LogsModal from './components/LogsModal'
+import { record, installErrorCapture } from './utils/diagnostics'
 import {
   getFileType,
   getExtension
@@ -114,8 +116,12 @@ function App() {
   const [showPreview, setShowPreview] = useState(false)
   const [previewUrl, setPreviewUrl] = useState(() => localStorage.getItem('previewUrl') || '')
   const [deletedFileToast, setDeletedFileToast] = useState(null)
-  const [showFolderPicker, setShowFolderPicker] = useState(true)
+  // Starts CLOSED and is opened only if the backend turns out to have no folder
+  // (see the /api/folder/info effect). Starting it open flashed the picker over
+  // the IDE for the moment it took to ask.
+  const [showFolderPicker, setShowFolderPicker] = useState(false)
   const [projectPath, setProjectPath] = useState(null)
+  const [showLogs, setShowLogs] = useState(false)
   const [showNewFolderModal, setShowNewFolderModal] = useState(false)
   const [newFolderName, setNewFolderName] = useState('')
   const [creatingFolder, setCreatingFolder] = useState(false)
@@ -422,6 +428,39 @@ function App() {
       setLoading(false)
     }
   }
+
+  // Open straight into the folder the backend was launched against.
+  //
+  // `vibefoundry <folder>` sets it at startup, and that is how the CLI, the
+  // desktop pane and every host launch all start it — so the folder is already
+  // decided by the time the UI loads and asking again is a question with one
+  // right answer. The picker used to open regardless, which in a pane made
+  // "which folder am I in?" the first thing you had to answer, and answered it
+  // wrongly whenever the pane was talking to a backend on some other project.
+  //
+  // The picker still exists for the one case that needs it — a backend started
+  // with no folder at all — and the Open Folder button still summons it.
+  useEffect(() => {
+    installErrorCapture()
+    let cancelled = false
+    fetch('/api/folder/info')
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => {
+        if (cancelled) return
+        // Recorded because "which folder did the IDE decide to open, and where
+        // did that come from" is the first question worth asking whenever the
+        // wrong project is on screen.
+        record('boot.folder', { folder: (data && data.project_folder) || null })
+        if (data && data.project_folder) handleFolderSelected(data.project_folder)
+        else setShowFolderPicker(true)
+      })
+      .catch(err => {
+        if (cancelled) return
+        record('boot.folder_failed', { message: String(err && err.message) })
+        setShowFolderPicker(true)
+      })
+    return () => { cancelled = true }
+  }, [])
 
   const handleFileSelect = async (file) => {
     if (file.isDirectory) return
@@ -952,6 +991,13 @@ function App() {
               Gemini
             </button>
             </>)}
+            {/* Deliberately OUTSIDE the !isPane block: a pane has no console,
+                no devtools and no visible server log, so this is the only way
+                to see what went wrong there — which is exactly where things go
+                wrong. */}
+            <button className="btn-flat" onClick={() => setShowLogs(true)}>
+              Logs
+            </button>
             <button className="btn-flat btn-auth" onClick={handleAuthToggle}>
               {isSignedIn ? 'Sign out' : 'Sign in'}
             </button>
@@ -1192,6 +1238,8 @@ function App() {
           onCancel={projectPath ? () => setShowFolderPicker(false) : undefined}
         />
       )}
+
+      {showLogs && <LogsModal onClose={() => setShowLogs(false)} />}
 
       {showNewFolderModal && (
         <div className="modal-overlay" onClick={() => !creatingFolder && setShowNewFolderModal(false)}>
