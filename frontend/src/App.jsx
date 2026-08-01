@@ -122,6 +122,20 @@ function App() {
   const [showFolderPicker, setShowFolderPicker] = useState(false)
   const [projectPath, setProjectPath] = useState(null)
   const [showLogs, setShowLogs] = useState(false)
+  const [showToolsMenu, setShowToolsMenu] = useState(false)
+  const toolsMenuRef = useRef(null)
+  // In-app zoom, persisted per machine. Buttons are the reliable path; the
+  // keyboard shortcut works wherever the host doesn't swallow it first.
+  const [zoom, setZoomState] = useState(() => {
+    const saved = parseInt(localStorage.getItem('vf_zoom'), 10)
+    return saved >= 50 && saved <= 150 ? saved : 100
+  })
+  const setZoom = (v) => {
+    const clamped = Math.min(150, Math.max(50, v))
+    setZoomState(clamped)
+    localStorage.setItem('vf_zoom', String(clamped))
+  }
+  const adjustZoom = (delta) => setZoom(zoom + delta)
   const [showNewFolderModal, setShowNewFolderModal] = useState(false)
   const [newFolderName, setNewFolderName] = useState('')
   const [creatingFolder, setCreatingFolder] = useState(false)
@@ -440,6 +454,27 @@ function App() {
   //
   // The picker still exists for the one case that needs it — a backend started
   // with no folder at all — and the Open Folder button still summons it.
+  // Close the tools menu on any outside click, and honor Cmd/Ctrl +/-/0 for
+  // zoom when the keystroke reaches us (in a browser it always does; in a host
+  // pane the host usually eats it, which is why the buttons exist).
+  useEffect(() => {
+    const onClick = (e) => {
+      if (toolsMenuRef.current && !toolsMenuRef.current.contains(e.target)) setShowToolsMenu(false)
+    }
+    const onKey = (e) => {
+      if (!(e.metaKey || e.ctrlKey)) return
+      if (e.key === '=' || e.key === '+') { e.preventDefault(); adjustZoom(10) }
+      else if (e.key === '-') { e.preventDefault(); adjustZoom(-10) }
+      else if (e.key === '0') { e.preventDefault(); setZoom(100) }
+    }
+    document.addEventListener('mousedown', onClick)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onClick)
+      document.removeEventListener('keydown', onKey)
+    }
+  })
+
   useEffect(() => {
     installErrorCapture()
     let cancelled = false
@@ -876,8 +911,19 @@ function App() {
     </div>
   )
 
+  // The brand moment: a centered logo while the app is still finding its
+  // backend/folder, instead of a blank pane or a bare "Open Folder" corner.
+  // It yields to the IDE on its own the instant a folder lands — no gate, no
+  // click. Shown only before a project exists and while no picker is up.
+  const bootSplash = !projectPath && !showFolderPicker && (
+    <div className="boot-splash">
+      <img src="/vf_logo.png" alt="VibeFoundry" className="boot-splash-logo" />
+    </div>
+  )
+
   const ideContent = (
-    <div className={`app ${isResizing ? 'resizing' : ''}`}>
+    <div className={`app ${isResizing ? 'resizing' : ''}`} style={{ zoom: zoom / 100 }}>
+      {bootSplash}
       {activeResizeCursor && (
         <div className="resize-capture-overlay" style={{ cursor: activeResizeCursor }} />
       )}
@@ -942,82 +988,57 @@ function App() {
             </div>
           </div>
           <div className="top-bar-section top-bar-right">
-            {/* These shell out to a NATIVE terminal window on the user's desktop.
-                Inside a host pane that window would open behind the app with no
-                way back to it, so hide them there rather than ship a dead button. */}
-            {!isPane && (<>
-            <button
-              className="btn-flat"
-              onClick={async () => {
-                try {
-                  await fetch('/api/terminal/launch', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path: projectPath })
-                  })
-                } catch (err) {
-                  console.error('Failed to launch terminal:', err)
-                }
-              }}
-            >
-              Terminal
-            </button>
-            <button
-              className="btn-flat btn-claude"
-              onClick={async () => {
-                try {
-                  await fetch('/api/terminal/launch', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path: projectPath, command: 'claude' })
-                  })
-                } catch (err) {
-                  console.error('Failed to launch Claude:', err)
-                }
-              }}
-            >
-              Claude
-            </button>
-            <button
-              className="btn-flat btn-codex"
-              onClick={async () => {
-                try {
-                  await fetch('/api/terminal/launch', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path: projectPath, command: 'codex' })
-                  })
-                } catch (err) {
-                  console.error('Failed to launch Codex:', err)
-                }
-              }}
-            >
-              Codex
-            </button>
-            <button
-              className="btn-flat btn-gemini"
-              onClick={async () => {
-                try {
-                  await fetch('/api/terminal/launch', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path: projectPath, command: 'gemini' })
-                  })
-                } catch (err) {
-                  console.error('Failed to launch Gemini:', err)
-                }
-              }}
-            >
-              Gemini
-            </button>
-            </>)}
-            {/* Deliberately OUTSIDE the !isPane block: a pane has no console,
-                no devtools and no visible server log, so this is the only way
-                to see what went wrong there — which is exactly where things go
-                wrong. */}
-            <button className="btn-flat" onClick={() => setShowLogs(true)}>
-              Logs
-            </button>
+            {/* Zoom lives in the app because embeds can't have it any other
+                way: inside a host pane Cmd+/- belongs to the HOST app and
+                scales its whole window — the IDE never sees the keystroke. */}
+            <div className="zoom-control">
+              <button className="btn-flat zoom-btn" onClick={() => adjustZoom(-10)} aria-label="Zoom out">−</button>
+              <button className="btn-flat zoom-btn zoom-value" onClick={() => setZoom(100)} title="Reset zoom">{zoom}%</button>
+              <button className="btn-flat zoom-btn" onClick={() => adjustZoom(10)} aria-label="Zoom in">+</button>
+            </div>
+            {/* One menu instead of five buttons: Terminal/Claude/Codex/Gemini
+                crowded the bar. The native-terminal entries still vanish in a
+                pane (they open desktop windows a pane can't reach); Logs stays
+                in every context — it's the only diagnostics a pane has. */}
+            <div className="tools-menu" ref={toolsMenuRef}>
+              <button className="btn-flat" onClick={() => setShowToolsMenu(v => !v)}>
+                Tools ▾
+              </button>
+              {showToolsMenu && (
+                <div className="tools-menu-list">
+                  {!isPane && ['Terminal', 'Claude', 'Codex', 'Gemini'].map(label => (
+                    <button
+                      key={label}
+                      className="tools-menu-item"
+                      onClick={async () => {
+                        setShowToolsMenu(false)
+                        try {
+                          await fetch('/api/terminal/launch', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(
+                              label === 'Terminal'
+                                ? { path: projectPath }
+                                : { path: projectPath, command: label.toLowerCase() }
+                            )
+                          })
+                        } catch (err) {
+                          console.error(`Failed to launch ${label}:`, err)
+                        }
+                      }}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                  <button
+                    className="tools-menu-item"
+                    onClick={() => { setShowToolsMenu(false); setShowLogs(true) }}
+                  >
+                    Logs
+                  </button>
+                </div>
+              )}
+            </div>
             <button className="btn-flat btn-auth" onClick={handleAuthToggle}>
               {isSignedIn ? 'Sign out' : 'Sign in'}
             </button>
@@ -1333,7 +1354,12 @@ function App() {
   )
 
   if (skipAuth) return ideContent
-  if (authStatus.loading) return null
+  // Even the auth check gets the logo rather than a blank frame.
+  if (authStatus.loading) return (
+    <div className="boot-splash">
+      <img src="/vf_logo.png" alt="VibeFoundry" className="boot-splash-logo" />
+    </div>
+  )
   if (authStatus.signedIn) return ideContent
   return renderSignInGate()
 }

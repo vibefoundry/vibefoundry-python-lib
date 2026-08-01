@@ -4622,3 +4622,73 @@ body {
 .signin-screen .cl-formButtonPrimary:active {
   background: rgba(30, 64, 175, 0.85) !important;
 }
+
+/* Tools dropdown — one menu instead of five top-bar buttons */
+.tools-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.tools-menu-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 140px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  z-index: 1050;
+}
+
+.tools-menu-item {
+  background: transparent;
+  border: none;
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  text-align: left;
+  font-size: var(--font-size-small);
+  font-family: var(--font-main);
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.tools-menu-item:hover {
+  background: var(--color-bg-subtle);
+}
+
+/* Zoom control — compact − / % / + cluster */
+.zoom-control {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.zoom-btn {
+  padding: 0 8px;
+  min-width: 28px;
+}
+
+.zoom-value {
+  min-width: 46px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Boot splash — the logo while the app finds its backend and folder */
+.boot-splash {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-bg);
+  z-index: 900;
+}
+
+.boot-splash-logo {
+  width: 140px;
+  max-width: 40vw;
+  opacity: 0.95;
+}
