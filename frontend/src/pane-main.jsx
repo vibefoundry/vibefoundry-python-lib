@@ -408,7 +408,7 @@ function goFullscreen() {
   } catch (e) { /* host may ignore */ }
 }
 
-function LaunchScreen() {
+function Centered({ children }) {
   return (
     <div
       style={{
@@ -424,6 +424,14 @@ function LaunchScreen() {
         fontFamily: FONT,
       }}
     >
+      {children}
+    </div>
+  )
+}
+
+function LaunchScreen() {
+  return (
+    <Centered>
       <button
         onClick={launch}
         style={{
@@ -437,9 +445,22 @@ function LaunchScreen() {
           boxShadow: '0 2px 10px rgba(0,0,0,.12)',
         }}
       >
-        Open VibeFoundry
+        Click Here To Launch VibeFoundry
       </button>
-    </div>
+    </Centered>
+  )
+}
+
+// Shown inline after the button is clicked. The full IDE renders in the
+// expanded side pane only — a miniature IDE crammed into the chat transcript
+// was noise, not a view anyone worked in.
+function OpenedScreen() {
+  return (
+    <Centered>
+      <div style={{ font: `600 15px ${FONT}`, color: '#0d0d0d' }}>
+        VibeFoundry Is Open In Your Side Pane!
+      </div>
+    </Centered>
   )
 }
 
@@ -447,15 +468,16 @@ const root = createRoot(document.getElementById('root'))
 let launched = false
 let currentView = null
 
-// Show the launch button inline; mount the real IDE once the user launches it
-// (or the host expands the widget to fullscreen). Driven by display mode so it
-// stays in sync however the pane is expanded.
+// Inline shows the launch button, then the confirmation once clicked. The IDE
+// itself mounts only when the host has this instance in fullscreen (the side
+// pane). Driven by display mode so it stays in sync however the pane is
+// expanded or collapsed.
 function render() {
   const mode = (window.openai && window.openai.displayMode) || 'inline'
-  const view = launched || mode === 'fullscreen' ? 'app' : 'launch'
+  const view = mode === 'fullscreen' ? 'app' : launched ? 'opened' : 'launch'
   if (view === currentView) return
   currentView = view
-  root.render(view === 'app' ? <App /> : <LaunchScreen />)
+  root.render(view === 'app' ? <App /> : view === 'opened' ? <OpenedScreen /> : <LaunchScreen />)
 }
 
 function launch() {
