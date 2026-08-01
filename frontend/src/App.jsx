@@ -443,22 +443,42 @@ function App() {
   useEffect(() => {
     installErrorCapture()
     let cancelled = false
-    fetch('/api/folder/info')
-      .then(res => (res.ok ? res.json() : null))
-      .then(data => {
-        if (cancelled) return
-        // Recorded because "which folder did the IDE decide to open, and where
-        // did that come from" is the first question worth asking whenever the
-        // wrong project is on screen.
-        record('boot.folder', { folder: (data && data.project_folder) || null })
-        if (data && data.project_folder) handleFolderSelected(data.project_folder)
-        else setShowFolderPicker(true)
-      })
-      .catch(err => {
-        if (cancelled) return
-        record('boot.folder_failed', { message: String(err && err.message) })
-        setShowFolderPicker(true)
-      })
+
+    // KEEP ASKING until a backend answers. One attempt is not enough in a pane:
+    // the widget can render off a FAILED tool call (the host renders it off the
+    // tool definition, success or not), and the real backend arrives seconds
+    // later when a retried call launches it. Giving up on the first failure is
+    // how the pane ended up stuck on a dead folder picker reading "Failed to
+    // load home directory" while a perfectly good backend came up behind it.
+    const deadline = Date.now() + 90 * 1000
+    const boot = async () => {
+      while (!cancelled) {
+        try {
+          const res = await fetch('/api/folder/info')
+          if (res.ok) {
+            const data = await res.json()
+            // Recorded because "which folder did the IDE decide to open, and
+            // where did that come from" is the first question worth asking
+            // whenever the wrong project is on screen.
+            record('boot.folder', { folder: (data && data.project_folder) || null })
+            if (data && data.project_folder) {
+              handleFolderSelected(data.project_folder)
+            } else {
+              // A live backend with no folder is the one case the picker is for.
+              setShowFolderPicker(true)
+            }
+            return
+          }
+        } catch { /* backend not up yet; keep waiting */ }
+        if (Date.now() > deadline) {
+          record('boot.folder_timeout', {})
+          setShowFolderPicker(true)
+          return
+        }
+        await new Promise(r => setTimeout(r, 2000))
+      }
+    }
+    boot()
     return () => { cancelled = true }
   }, [])
 
