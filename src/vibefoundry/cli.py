@@ -113,6 +113,20 @@ def main(args: Optional[list[str]] = None):
         print(f"Error: Not a directory: {project_folder}")
         sys.exit(1)
 
+    # Fail HERE, legibly, if macOS is blocking this process from the folder —
+    # otherwise the denial surfaces minutes later as a PermissionError buried
+    # in an import-time traceback (rich calls os.getcwd() on import), which
+    # reads like a broken install instead of a privacy setting.
+    try:
+        os.listdir(project_folder)
+    except PermissionError:
+        print("")
+        print("macOS is blocking this app from that folder (Privacy & Security).")
+        print("Fix: System Settings > Privacy & Security > Files and Folders >")
+        print("     Terminal > enable Documents Folder — then run this again.")
+        print("(If a permission dialog appears instead, just click Allow.)")
+        sys.exit(1)
+
     # Set environment variable for server to pick up
     os.environ["VIBEFOUNDRY_PROJECT_PATH"] = str(project_folder)
     print(f"Project folder: {project_folder}")
