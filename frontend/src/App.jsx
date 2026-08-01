@@ -1259,6 +1259,27 @@ function App() {
         />
       )}
 
+      {/* The top bar (and its Logs button) only exists once a project is open —
+          which means the one state where diagnostics matter most, nothing
+          loading at all, had no way to reach them. Float one when the bar is
+          absent so Logs is reachable from every state, including total failure. */}
+      {!(canWrite && tree.length > 0) && (
+        <button
+          className="btn-flat"
+          onClick={() => setShowLogs(true)}
+          style={{
+            position: 'fixed',
+            top: '10px',
+            right: '12px',
+            zIndex: 1200,
+            background: 'var(--color-bg)',
+            border: '1px solid var(--color-border)',
+          }}
+        >
+          Logs
+        </button>
+      )}
+
       {showLogs && <LogsModal onClose={() => setShowLogs(false)} />}
 
       {showNewFolderModal && (
