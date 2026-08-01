@@ -382,7 +382,11 @@ async def lifespan(app: FastAPI):
         folder = Path(project_path)
         if folder.exists() and folder.is_dir():
             state.project_folder = folder
-            setup_project_structure(folder)
+            # No scaffolding here: opening a folder must not modify it. Every
+            # other path already lives by that rule — generate_metadata no-ops
+            # until app_folder exists, the watcher only watches folders that
+            # exist, folder/select creates nothing. Structure is created in
+            # exactly one place: the Build button (/api/build).
             generate_metadata(folder)
             state.watcher = FileWatcher(folder)
             state.watcher.scan_initial_state()
