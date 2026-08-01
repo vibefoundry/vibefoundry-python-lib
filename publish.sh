@@ -4,10 +4,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Set version — use argument if provided, otherwise read from pyproject.toml
+# Set version — use argument if provided, otherwise read from pyproject.toml.
+# Both pyproject.toml AND __init__.py carry it: pyproject is what pip reports,
+# __init__ is what --version and /api/health report. Bumping only one shipped
+# a 0.4.1 wheel that announced itself as 0.4.0 — so they move together here.
 if [ -n "$1" ]; then
   VERSION="$1"
   sed -i '' "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
+  sed -i '' "s/^__version__ = \".*\"/__version__ = \"${VERSION}\"/" src/vibefoundry/__init__.py
   echo "Version updated to ${VERSION}"
 else
   VERSION=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
