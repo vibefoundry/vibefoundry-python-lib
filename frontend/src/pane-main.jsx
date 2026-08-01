@@ -387,14 +387,19 @@ if (typeof MutationObserver !== 'undefined') {
   })
 }
 
-// --- Mount immediately, expand immediately -----------------------------------
+// --- Inline = a single launch button; the full IDE mounts only in the pane ---
 //
-// There used to be an "Open VibeFoundry" button here that mounted the IDE on
-// click. It was one more step for something with only one outcome — the tool
-// call that rendered this pane already said to open VibeFoundry — and it made
-// the moment the IDE bound to a backend depend on when the user clicked, which
-// is exactly the sort of timing this pane should not have. So: ask for
-// fullscreen on load and mount the app straight away.
+// The button is not just a launch trigger, and removing it broke the pane: the
+// host renders this widget off the TOOL DEFINITION, so it appears even when the
+// call failed and no backend exists. Mounting <App/> unconditionally then put a
+// full IDE on screen with nothing behind it — every request failed, and the user
+// got a folder picker reporting "Failed to load home directory".
+//
+// So the button stays. It is the one thing standing between a failed tool call
+// and an IDE that looks broken.
+const FONT =
+  'ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'
+
 function goFullscreen() {
   try {
     if (window.openai && window.openai.requestDisplayMode) {
@@ -403,13 +408,61 @@ function goFullscreen() {
   } catch (e) { /* host may ignore */ }
 }
 
+function LaunchScreen() {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        textAlign: 'center',
+        minHeight: '190px',
+        height: '100%',
+        width: '100%',
+        margin: 0,
+        background: '#ffffff',
+        fontFamily: FONT,
+      }}
+    >
+      <button
+        onClick={launch}
+        style={{
+          font: `600 15px ${FONT}`,
+          padding: '13px 24px',
+          background: '#0d0d0d',
+          color: '#fff',
+          border: 'none',
+          borderRadius: '10px',
+          cursor: 'pointer',
+          boxShadow: '0 2px 10px rgba(0,0,0,.12)',
+        }}
+      >
+        Open VibeFoundry
+      </button>
+    </div>
+  )
+}
+
 const root = createRoot(document.getElementById('root'))
+let launched = false
+let currentView = null
 
-goFullscreen()
-root.render(<App />)
+// Show the launch button inline; mount the real IDE once the user launches it
+// (or the host expands the widget to fullscreen). Driven by display mode so it
+// stays in sync however the pane is expanded.
+function render() {
+  const mode = (window.openai && window.openai.displayMode) || 'inline'
+  const view = launched || mode === 'fullscreen' ? 'app' : 'launch'
+  if (view === currentView) return
+  currentView = view
+  root.render(view === 'app' ? <App /> : <LaunchScreen />)
+}
 
-// The host can expand or collapse the widget after load. Re-ask for fullscreen
-// when it does, so a collapse doesn't strand the IDE in an inline strip.
-window.addEventListener('openai:set_globals', () => {
-  if ((window.openai && window.openai.displayMode) !== 'fullscreen') goFullscreen()
-})
+function launch() {
+  launched = true
+  goFullscreen()
+  render()
+}
+
+window.addEventListener('openai:set_globals', render)
+render()
