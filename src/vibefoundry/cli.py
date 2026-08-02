@@ -43,6 +43,75 @@ def run_server(port: int, host: str = "127.0.0.1"):
     )
 
 
+# --- the quiet, branded terminal ------------------------------------------------
+# The backend's window is the user's first impression of the product, and it
+# used to greet them with uvicorn chatter, watcher prints and PTY notices. Now
+# it shows a purple VF splash and then goes silent: everything the process (and
+# its children — the redirect is at the file-descriptor level, so subprocesses
+# inherit it) would have printed lands in a per-port log instead. The history
+# is never lost, just moved: `vibefoundry --show-log` prints it in full.
+
+PURPLE = "\033[38;5;135m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+BANNER = r"""
+  ██╗   ██╗ ███████╗
+  ██║   ██║ ██╔════╝
+  ██║   ██║ █████╗
+  ╚██╗ ██╔╝ ██╔══╝
+   ╚████╔╝  ██║
+    ╚═══╝   ╚═╝
+"""
+
+
+def _log_dir() -> Path:
+    d = Path.home() / ".vibefoundry" / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def show_log() -> int:
+    """Print the most recent backend log in full (the --show-log command)."""
+    logs = sorted(_log_dir().glob("backend-*.log"), key=lambda p: p.stat().st_mtime)
+    if not logs:
+        print("No backend logs yet — launch VibeFoundry first.")
+        return 0
+    latest = logs[-1]
+    print(f"── {latest} ──\n")
+    print(latest.read_text(errors="replace"))
+    return 0
+
+
+def print_banner(port: int, url: str, project_folder: Path) -> None:
+    print(PURPLE + BANNER + RESET)
+    print(f"  {PURPLE}VibeFoundry IDE{RESET} v{__version__}")
+    print(f"  {DIM}Project{RESET}  {project_folder}")
+    print(f"  {DIM}Running{RESET}  {url}")
+    print()
+    print(f"  {DIM}Press Ctrl+C to stop  ·  full log: vibefoundry --show-log{RESET}")
+    print()
+
+
+def redirect_output_to_log(port: int):
+    """
+    Send every future print — this process's AND its children's — to the log
+    file, keeping the splash as the only thing on screen. Returns a writer for
+    the real terminal, for the one message that still belongs there (shutdown).
+    """
+    tty_fd = os.dup(1)
+    tty = os.fdopen(tty_fd, "w", buffering=1)
+    log_path = _log_dir() / f"backend-{port}.log"
+    log = open(log_path, "w", buffering=1)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.dup2(log.fileno(), 1)
+    os.dup2(log.fileno(), 2)
+    sys.stdout = os.fdopen(os.dup(1), "w", buffering=1)
+    sys.stderr = os.fdopen(os.dup(2), "w", buffering=1)
+    return tty
+
+
 def main(args: Optional[list[str]] = None):
     """Main entry point for vibefoundry CLI"""
     parser = argparse.ArgumentParser(
@@ -88,8 +157,17 @@ def main(args: Optional[list[str]] = None):
         help="Print the path to the bundled pane HTML and exit. How an MCP "
              "server locates the pane without hardcoding install layouts."
     )
+    parser.add_argument(
+        "--show-log",
+        action="store_true",
+        help="Print the most recent backend log in full and exit. The running "
+             "terminal shows only the splash; everything else lands here."
+    )
 
     parsed_args = parser.parse_args(args)
+
+    if parsed_args.show_log:
+        return show_log()
 
     # Resolve-and-exit: no server, no project folder needed.
     if parsed_args.pane_path:
@@ -129,21 +207,32 @@ def main(args: Optional[list[str]] = None):
 
     # Set environment variable for server to pick up
     os.environ["VIBEFOUNDRY_PROJECT_PATH"] = str(project_folder)
-    print(f"Project folder: {project_folder}")
 
     # Find available port
     port = parsed_args.port or find_available_port()
     host = parsed_args.host
     local_url = f"http://{host}:{port}"
 
-    print(f"Starting VibeFoundry IDE v{__version__}")
-    print(f"App: {local_url}")
+    # Splash on screen, everything else to the log. --dev keeps the old
+    # firehose in the terminal for anyone actually working on the library.
+    if parsed_args.dev:
+        tty = sys.stdout
+        print(f"Project folder: {project_folder}")
+        print(f"Starting VibeFoundry IDE v{__version__}")
+        print(f"App: {local_url}")
+    else:
+        print_banner(port, local_url, project_folder)
+        tty = redirect_output_to_log(port)
 
     # Handle Ctrl+C gracefully
     shutdown_event = threading.Event()
 
     def signal_handler(signum, frame):
-        print("\nShutting down...")
+        try:
+            tty.write(f"\n  {PURPLE}✓{RESET} VibeFoundry stopped.\n")
+            tty.flush()
+        except Exception:
+            pass
         shutdown_event.set()
         sys.exit(0)
 
@@ -187,14 +276,16 @@ def main(args: Optional[list[str]] = None):
         else:
             print("Opened in default browser")
 
-    print("\nPress Ctrl+C to stop the server")
-
     # Keep main thread alive
     try:
         while not shutdown_event.is_set():
             time.sleep(0.5)
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        try:
+            tty.write(f"\n  {PURPLE}✓{RESET} VibeFoundry stopped.\n")
+            tty.flush()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
