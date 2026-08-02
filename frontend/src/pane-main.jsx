@@ -11,6 +11,7 @@
 // This file is ONLY used by vite.pane.config.js. The standalone app (main.jsx)
 // never loads it, so none of this affects the normal pip-installed IDE.
 
+import { useState, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.jsx'
@@ -429,6 +430,53 @@ function Centered({ children }) {
   )
 }
 
+// The setup progress card. Rendered whenever this widget is attached to a
+// setup_vibefoundry result — Codex renders widgets automatically, so this is
+// the deterministic in-app progress display: it polls the plugin's own state
+// through the relay and shows the live step list. No model, no terminal
+// windows; what's on screen is what the installer is doing.
+function SetupCard({ initial }) {
+  const [s, setS] = useState(initial || { phase: 'announce', plan: [], current: null, message: '' })
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      const res = await backendRequest('/__plugin/setup-state')
+      if (alive && res && res.json && res.json.phase && res.json.phase !== 'idle') setS(res.json)
+      if (alive) setTimeout(poll, 700)
+    }
+    poll()
+    return () => { alive = false }
+  }, [])
+
+  const sub =
+    s.phase === 'done' ? `✓ All set — ${s.version || ''}. Say "open VibeFoundry" to start.` :
+    s.phase === 'failed' ? 'Setup stopped — say "set me up" again to resume.' :
+    s.current ? `Step ${s.current.index} of ${s.current.total}` : 'preparing…'
+
+  return (
+    <div style={{ fontFamily: FONT, background: '#fff', padding: '18px 22px', color: '#0d0d0d' }}>
+      <div style={{ fontSize: 30, fontWeight: 800, color: '#2070e8', letterSpacing: -1.5 }}>vf</div>
+      <div style={{ fontSize: 15, fontWeight: 600, margin: '4px 0 2px' }}>Setting up your computer</div>
+      <div style={{ fontSize: 12, color: '#5d5d5d', marginBottom: 10 }}>{sub}</div>
+      {(s.plan || []).map((p2, i) => {
+        const active = s.current && s.current.index === i + 1
+        return (
+          <div key={p2.title} style={{
+            padding: '3px 0', fontSize: 13,
+            color: p2.satisfied ? '#1a7f37' : active ? '#2070e8' : '#8f8f8f',
+            fontWeight: active ? 600 : 400,
+          }}>
+            {p2.satisfied ? '✓' : active ? '→' : '·'}  {p2.title}
+          </div>
+        )
+      })}
+      <div style={{ fontSize: 12, color: s.error ? '#b42318' : '#5d5d5d', marginTop: 8, minHeight: 16 }}>
+        {s.message || (s.error ? `✗ ${s.error}` : '')}
+      </div>
+    </div>
+  )
+}
+
 function LaunchScreen() {
   return (
     <Centered>
@@ -473,6 +521,16 @@ let currentView = null
 // pane). Driven by display mode so it stays in sync however the pane is
 // expanded or collapsed.
 function render() {
+  // A widget attached to a setup_vibefoundry result IS the progress card —
+  // its output carries a phase. Launch/open results carry a status instead.
+  const out = window.openai && window.openai.toolOutput
+  if (out && out.phase) {
+    if (currentView !== 'setup') {
+      currentView = 'setup'
+      root.render(<SetupCard initial={out} />)
+    }
+    return
+  }
   const mode = (window.openai && window.openai.displayMode) || 'inline'
   const view = mode === 'fullscreen' ? 'app' : launched ? 'opened' : 'launch'
   if (view === currentView) return
