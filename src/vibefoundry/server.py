@@ -98,6 +98,13 @@ class AppState:
     websocket_clients: list[WebSocket] = []
     # Debounce for script change notifications (prevent duplicates)
     last_script_change: dict[str, float] = {}  # path -> timestamp
+    # True when a host plugin registered this backend as an embedded pane.
+    # Set via POST /api/ui/pane by code that KNOWS (the plugin, at open time),
+    # read by the frontend at boot — so pane chrome is a fact served by the
+    # backend, not a guess from URLs or embedding tricks. Claude's preview is
+    # a native webview (not framed) and forbids query strings in its config
+    # URLs, which killed every client-side detection in turn.
+    pane_mode: bool = False
 
 
 class DataFrameState:
@@ -432,7 +439,19 @@ async def health_check():
         "status": "ok",
         "version": __version__,
         "project_folder": str(state.project_folder) if state.project_folder else None,
+        "pane_mode": state.pane_mode,
     }
+
+
+class PaneModeRequest(BaseModel):
+    enabled: bool = True
+
+
+@app.post("/api/ui/pane")
+async def set_pane_mode(request: PaneModeRequest):
+    """Mark this backend as pane-hosted (called by the host plugin, not the UI)."""
+    state.pane_mode = bool(request.enabled)
+    return {"status": "ok", "pane_mode": state.pane_mode}
 
 
 class LaunchTerminalRequest(BaseModel):

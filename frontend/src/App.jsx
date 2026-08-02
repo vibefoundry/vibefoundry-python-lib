@@ -21,17 +21,31 @@ function App() {
   const [appVersion, setAppVersion] = useState('')
 
   // True when running EMBEDDED in a host pane rather than as the standalone app.
-  // Three host-neutral signals, any of which flips pane mode:
+  // Host-neutral signals, any of which flips pane mode:
   //   - window.openai       -> Codex / ChatGPT desktop-app widget
-  //   - framed (self!=top)  -> Claude Code preview (and any iframe embed)
-  //   - ?pane=1             -> explicit override for testing / custom launches
+  //   - framed (self!=top)  -> iframe embeds
+  //   - ?pane=1             -> explicit marker for webview hosts (Claude Code's
+  //                            preview is a NATIVE webview — not framed — and
+  //                            forbids query strings in its config URLs, so the
+  //                            marker arrives via a one-time navigation and is
+  //                            REMEMBERED in this webview's own storage. Real
+  //                            browsers have separate storage and never see it.)
   // Nothing else is needed to make a host feel native: the theme is already
   // neutral for everyone. This only hides chrome that cannot work in a pane.
-  const isPane = typeof window !== 'undefined' && (
-    !!window.openai ||
-    window.self !== window.top ||
-    new URLSearchParams(window.location.search).get('pane') === '1'
-  )
+  const clientIsPane = typeof window !== 'undefined' && (() => {
+    if (window.openai || window.self !== window.top) return true
+    if (new URLSearchParams(window.location.search).get('pane') === '1') {
+      try { localStorage.setItem('vf_pane', '1') } catch { /* storage may be off */ }
+      return true
+    }
+    try { return localStorage.getItem('vf_pane') === '1' } catch { return false }
+  })()
+  // The DETERMINISTIC signal: the backend says whether it is pane-hosted,
+  // because the host plugin told it so in code at open time (POST /api/ui/pane).
+  // Client-side signals above remain for hosts that provide them natively;
+  // this one needs nothing from the URL, the webview, or the model.
+  const [backendPane, setBackendPane] = useState(false)
+  const isPane = clientIsPane || backendPane
 
   // Read the version off the backend rather than hardcoding it here, so the
   // footer can't drift from the installed package the way it did before.
@@ -39,7 +53,11 @@ function App() {
     let cancelled = false
     fetch('/api/health')
       .then(res => (res.ok ? res.json() : null))
-      .then(data => { if (data?.version && !cancelled) setAppVersion(data.version) })
+      .then(data => {
+        if (cancelled || !data) return
+        if (data.version) setAppVersion(data.version)
+        if (data.pane_mode) setBackendPane(true)
+      })
       .catch(() => {})
     return () => { cancelled = true }
   }, [])
