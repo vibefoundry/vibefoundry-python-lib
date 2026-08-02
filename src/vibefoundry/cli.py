@@ -83,14 +83,61 @@ def show_log() -> int:
     return 0
 
 
-def print_banner(port: int, url: str, project_folder: Path) -> None:
-    print(PURPLE + BANNER + RESET)
-    print(f"  {PURPLE}VibeFoundry IDE{RESET} v{__version__}")
-    print(f"  {DIM}Project{RESET}  {project_folder}")
-    print(f"  {DIM}Running{RESET}  {url}")
-    print()
-    print(f"  {DIM}Press Ctrl+C to stop  ·  full log: vibefoundry --show-log{RESET}")
-    print()
+def _uptime_text(started_at: float) -> str:
+    secs = int(time.time() - started_at)
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    return ", ".join(parts)
+
+
+def _current_folder(url: str, fallback) -> str:
+    """The folder the SERVER believes in right now — it can change after launch
+    via the IDE's picker, so the splash asks rather than remembers."""
+    try:
+        import json
+        with urllib.request.urlopen(f"{url}/api/health", timeout=1) as r:
+            folder = json.load(r).get("project_folder")
+            return folder or (str(fallback) if fallback else "")
+    except Exception:
+        return str(fallback) if fallback else ""
+
+
+def render_splash(tty, url: str, project_folder, started_at: float) -> None:
+    """The whole screen, redrawn: the backend introducing itself, with live
+    uptime and the folder it is actually serving."""
+    folder = _current_folder(url, project_folder)
+    lines = [
+        PURPLE + BANNER + RESET,
+        f"  {PURPLE}Hi! I'm your VibeFoundry Backend.{RESET}  (v{__version__})",
+        "",
+        "  I'm the engine that lets you preview big datasets, run code,",
+        "  and monitor app activity.",
+        "",
+    ]
+    if folder:
+        lines.append(f"  I'm currently operating out of:")
+        lines.append(f"    {folder}")
+    else:
+        lines.append(f"  {DIM}No project folder chosen yet — pick one in the IDE.{RESET}")
+    lines += [
+        "",
+        f"  I've been open for {_uptime_text(started_at)}.",
+        "",
+        f"  Once you're done with VibeFoundry in Claude or Codex,",
+        f"  please shut me down!  {DIM}(Ctrl+C here){RESET}",
+        "",
+        f"  {DIM}Running {url}  ·  full log: vibefoundry --show-log{RESET}",
+        "",
+    ]
+    tty.write("\033[2J\033[H" + "\n".join(lines) + "\n")
+    tty.flush()
 
 
 def redirect_output_to_log(port: int):
@@ -215,14 +262,15 @@ def main(args: Optional[list[str]] = None):
 
     # Splash on screen, everything else to the log. --dev keeps the old
     # firehose in the terminal for anyone actually working on the library.
+    started_at = time.time()
     if parsed_args.dev:
         tty = sys.stdout
         print(f"Project folder: {project_folder}")
         print(f"Starting VibeFoundry IDE v{__version__}")
         print(f"App: {local_url}")
     else:
-        print_banner(port, local_url, project_folder)
         tty = redirect_output_to_log(port)
+        render_splash(tty, local_url, project_folder, started_at)
 
     # Handle Ctrl+C gracefully
     shutdown_event = threading.Event()
@@ -276,10 +324,18 @@ def main(args: Optional[list[str]] = None):
         else:
             print("Opened in default browser")
 
-    # Keep main thread alive
+    # Keep main thread alive; in quiet mode, refresh the splash every 30s so
+    # the uptime ticks and a folder picked later in the IDE shows up.
     try:
+        last_render = time.time()
         while not shutdown_event.is_set():
             time.sleep(0.5)
+            if not parsed_args.dev and time.time() - last_render >= 30:
+                last_render = time.time()
+                try:
+                    render_splash(tty, local_url, project_folder, started_at)
+                except Exception:
+                    pass  # a failed redraw must never take the backend down
     except KeyboardInterrupt:
         try:
             tty.write(f"\n  {PURPLE}✓{RESET} VibeFoundry stopped.\n")
