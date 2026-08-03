@@ -974,7 +974,14 @@ function App() {
   )
 
   const ideContent = (
-    <div className={`app ${isResizing ? 'resizing' : ''}`} style={{ zoom: zoom / 100 }}>
+    <div
+      className={`app ${isResizing ? 'resizing' : ''}`}
+      // zoom scales the RENDERED size of this box, so compensate the layout
+      // size by the inverse — at 80% the element is 125% tall/wide and renders
+      // back to exactly full screen. Without this, zooming out shrank the
+      // whole IDE into a corner and left dead space below.
+      style={{ zoom: zoom / 100, width: `${10000 / zoom}%`, height: `${10000 / zoom}%` }}
+    >
       {bootSplash}
       {activeResizeCursor && (
         <div className="resize-capture-overlay" style={{ cursor: activeResizeCursor }} />
