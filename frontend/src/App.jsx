@@ -47,6 +47,23 @@ function App() {
   const [backendPane, setBackendPane] = useState(false)
   const isPane = clientIsPane || backendPane
 
+  // Windows display scaling applies TWICE in embedded webviews — host window
+  // scaled, webview scales again by devicePixelRatio — so every page renders
+  // ~2x and pours off the right edge until a resize. Counter with 1/dpr,
+  // Windows + embedded only: macOS renders correctly at its dpr, and a real
+  // browser tab must keep native scaling. Ported from the legacy plugin's
+  // 'display-scaling double-zoom' fix; composes with the user zoom control,
+  // which scales a different element.
+  useEffect(() => {
+    const isWindows = /Windows/i.test(navigator.userAgent || '')
+    const dpr = window.devicePixelRatio || 1
+    if (isPane && isWindows && dpr > 1) {
+      document.documentElement.style.zoom = String(1 / dpr)
+    } else if (document.documentElement.style.zoom) {
+      document.documentElement.style.zoom = ''
+    }
+  }, [isPane])
+
   // Read the version off the backend rather than hardcoding it here, so the
   // footer can't drift from the installed package the way it did before.
   useEffect(() => {
