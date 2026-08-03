@@ -976,11 +976,12 @@ function App() {
   const ideContent = (
     <div
       className={`app ${isResizing ? 'resizing' : ''}`}
-      // zoom scales the RENDERED size of this box, so compensate the layout
-      // size by the inverse — at 80% the element is 125% tall/wide and renders
-      // back to exactly full screen. Without this, zooming out shrank the
-      // whole IDE into a corner and left dead space below.
-      style={{ zoom: zoom / 100, width: `${10000 / zoom}%`, height: `${10000 / zoom}%` }}
+      // Percentage sizes self-compensate under CSS zoom in Chromium — they
+      // resolve against the parent and render back to its true size — while
+      // viewport units (the old height:100vh) scale with the zoom and shrank
+      // the IDE. So: plain 100%. (An explicit inverse compensation on top of
+      // percentages double-corrects and overflows the bottom.)
+      style={{ zoom: zoom / 100, width: '100%', height: '100%' }}
     >
       {bootSplash}
       {activeResizeCursor && (
