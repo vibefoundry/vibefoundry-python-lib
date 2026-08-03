@@ -54,6 +54,32 @@ def run_server(port: int, host: str = "127.0.0.1"):
 PURPLE = "\033[38;5;135m"
 DIM = "\033[2m"
 RESET = "\033[0m"
+CLEAR = "\033[2J\033[H"
+
+
+def enable_terminal_colors() -> None:
+    """
+    Make ANSI safe everywhere. Windows Terminal renders escape codes natively,
+    but a classic cmd window shows them as literal garbage unless VT processing
+    is switched on — so try to enable it, and if the console refuses, blank the
+    codes entirely: a plain splash beats escape-code soup.
+    """
+    global PURPLE, DIM, RESET, CLEAR
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # stdout
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            if kernel32.SetConsoleMode(handle, mode.value | 0x0004):  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                return
+    except Exception:
+        pass
+    PURPLE = DIM = RESET = ""
+    CLEAR = "\n\n"
 
 BANNER = r"""
   ██╗   ██╗ ███████╗
@@ -136,7 +162,7 @@ def render_splash(tty, url: str, project_folder, started_at: float) -> None:
         f"  {DIM}Running {url}  ·  full log: vibefoundry --show-log{RESET}",
         "",
     ]
-    tty.write("\033[2J\033[H" + "\n".join(lines) + "\n")
+    tty.write(CLEAR + "\n".join(lines) + "\n")
     tty.flush()
 
 
@@ -263,6 +289,7 @@ def main(args: Optional[list[str]] = None):
     # Splash on screen, everything else to the log. --dev keeps the old
     # firehose in the terminal for anyone actually working on the library.
     started_at = time.time()
+    enable_terminal_colors()
     if parsed_args.dev:
         tty = sys.stdout
         print(f"Project folder: {project_folder}")
