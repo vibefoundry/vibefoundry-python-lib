@@ -4441,6 +4441,8 @@ body {
 .signin-screen {
   position: fixed;
   inset: 0;
+  padding: 24px;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -4481,7 +4483,8 @@ body {
 /* Custom sign-in card (replaces Clerk's <SignIn> component now that auth
    is delegated to vibefoundry.ai/ide-auth in a popup tab). */
 .signin-card-custom {
-  width: 380px;
+  width: 100%;
+  max-width: 380px;
   border-radius: 12px;
   border: 1px solid rgba(147, 197, 253, 0.5);
   background: rgba(219, 234, 254, 0.16);

@@ -493,6 +493,23 @@ function App() {
     }
   })
 
+  // Windows webviews can compute the FIRST layout against wrong viewport
+  // metrics (DPI-scaling confusion) — everything centers off-screen until a
+  // real resize forces a recompute. Nudge that recompute ourselves: a few
+  // staggered forced reflows after first paint, harmless where metrics were
+  // right all along. (The legacy plugin fought the same class of bug as
+  // 'display-scaling double-zoom'.)
+  useEffect(() => {
+    const kick = () => {
+      document.documentElement.style.minWidth = '100.0%'
+      void document.documentElement.offsetWidth // force reflow
+      document.documentElement.style.minWidth = ''
+      window.dispatchEvent(new Event('resize'))
+    }
+    const timers = [100, 400, 1000, 2000].map(ms => setTimeout(kick, ms))
+    return () => timers.forEach(clearTimeout)
+  }, [])
+
   useEffect(() => {
     installErrorCapture()
     let cancelled = false
