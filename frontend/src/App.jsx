@@ -145,8 +145,6 @@ function App() {
   const [dataCatalog, setDataCatalog] = useState(null)
   const [dataCatalogError, setDataCatalogError] = useState(null)
   const [loadingDataCatalog, setLoadingDataCatalog] = useState(false)
-  const [isDownloadingData, setIsDownloadingData] = useState(false)
-  const [downloadingDataId, setDownloadingDataId] = useState(null)
   const [showDownloadModal, setShowDownloadModal] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [isDownloading, setIsDownloading] = useState(false)
@@ -861,28 +859,6 @@ function App() {
     loadDataCatalog()
   }
 
-  const handleDownloadData = async (datasetId) => {
-    if (!projectPath || !canWrite || isDownloadingData) return
-    setIsDownloadingData(true)
-    setDownloadingDataId(datasetId)
-    try {
-      const res = await fetch('/api/data/public/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dataset_id: datasetId }),
-      })
-      if (!res.ok) throw new Error(`Download failed (${res.status})`)
-      await handleRefresh()
-      setShowDataModal(false)
-    } catch (err) {
-      console.error('Failed to download dataset:', err)
-      setDataCatalogError('That download did not complete. Try again.')
-    } finally {
-      setIsDownloadingData(false)
-      setDownloadingDataId(null)
-    }
-  }
-
   const handleDeleteTemplates = async () => {
     if (!projectPath || !canWrite || isDeleting) return
     setIsDeleting(true)
@@ -1296,9 +1272,7 @@ function App() {
         catalog={dataCatalog}
         catalogError={dataCatalogError}
         loadingCatalog={loadingDataCatalog}
-        isDownloading={isDownloadingData}
-        downloadingId={downloadingDataId}
-        onSelect={handleDownloadData}
+        onSaved={handleRefresh}
         onClose={() => setShowDataModal(false)}
       />
 

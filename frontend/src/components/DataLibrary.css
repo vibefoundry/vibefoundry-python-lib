@@ -1,0 +1,584 @@
+/* Wide horizontal padding so the cards don't crowd the academy sidebar on the
+   left or run to the window edge on the right. */
+.pubdata-page {
+  position: relative;
+  padding: 1.25rem 3rem;
+  min-height: 100vh;
+  background: #e8edf3;
+  font-family: 'Inter', system-ui, sans-serif;
+  color: #0f172a;
+}
+
+/* Same 32px blueprint grid the Rubric / Maturity / lesson pages use, so the
+   margin either side of the narrowed cards reads as page background rather
+   than dead grey. */
+.pubdata-page::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-image:
+    linear-gradient(rgba(37, 99, 235, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(37, 99, 235, 0.06) 1px, transparent 1px);
+  background-size: 32px 32px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Cards sit above the grid. */
+.pubdata-container,
+.pubdata-status {
+  position: relative;
+  z-index: 1;
+}
+
+.pubdata-status {
+  font-size: 0.9rem;
+  color: #64748b;
+}
+
+.pubdata-status-error { color: #b91c1c; }
+.pubdata-status-done  { color: #15803d; }
+
+/* Last-updated stamp on the left, Update button on the right, aligned to the
+   same 1400px column the cards use so it sits flush with their right edge. */
+.pubdata-toolbar {
+  position: relative;
+  z-index: 1;
+  max-width: 1400px;
+  margin: 0 auto 0.85rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+/* Category filter — a row of pills on the left of the toolbar. Wraps rather
+   than scrolls so no category can be hidden off the edge. */
+.pubdata-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.pubdata-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.32rem 0.7rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #fff;
+  color: #334155;
+  font-family: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pubdata-filter:hover { border-color: #94a3b8; }
+
+/* The active pill takes the academy accent inline, so it stays on-brand per
+   client instead of assuming one colour. */
+.pubdata-filter.is-on { color: #fff; }
+
+.pubdata-filter-count {
+  font-size: 0.7rem;
+  font-weight: 700;
+  opacity: 0.7;
+}
+
+.pubdata-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  flex-shrink: 0;
+}
+
+.pubdata-updated {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.pubdata-update {
+  padding: 0.4rem 1.1rem;
+  border: none;
+  border-radius: 7px;
+  color: #fff;
+  font-size: 0.8rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.pubdata-update:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* One container per dataset. padding: 0 fights off LandingPage.css's global
+   `section { padding: 5rem 0 }` leak so the banner sits flush at the top. */
+.pubdata-container {
+  /* Capped and centred so the cards stay a readable width on wide monitors
+     instead of stretching edge to edge. */
+  max-width: 1400px;
+  margin-inline: auto;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  overflow: hidden;
+  padding: 0;
+}
+
+.pubdata-container + .pubdata-container {
+  margin-top: 1.5rem;
+}
+
+/* Two equal panes: title fills the left half, description the right half.
+   A 1fr 1fr grid keeps the split at exactly 50/50 regardless of text length.
+   The height is FIXED, not min-height: descriptions differ in length and wrap
+   to different line counts at a given width, so an auto-height banner would
+   render a different size on every card. 140px fits five wrapped lines. */
+
+
+.pubdata-download:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: #fff;
+}
+
+/* Clamped to the six lines the fixed-height banner has room for, so an
+   unusually long description can never push the banner out of alignment.
+   The type is sized so the longest real description still fits six lines at
+   the width the academy renders this page at (~960px of content). */
+/* The card is two panes: an accent pane that says what the dataset is and how
+   to get it, and the row preview. Fixed height so every card is identical
+   regardless of how long its description runs. */
+.pubdata-body {
+  display: grid;
+  grid-template-columns: 460px 1fr;
+  height: 336px;
+}
+
+.pubdata-intro {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-right: 1px solid #e2e8f0;
+}
+
+/* The banner. Sits above the description, with the download button on its
+   right — the button is out of the description's flow entirely, so a long
+   title or a long description can never move it. */
+.pubdata-intro-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 1.25rem;
+  color: #fff;
+}
+
+.pubdata-intro-title {
+  min-width: 0;
+  font-size: 1.3rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+/* Clamped so a long description can never push the download button out of the
+   fixed-height pane. */
+.pubdata-intro-desc {
+  /* Centred in the pane both ways: the auto margins take the slack under a
+     short description, so every card's text sits in the same optical place
+     rather than hugging the banner. */
+  margin: auto 0;
+  padding: 0.9rem 1.35rem;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 11;
+  overflow: hidden;
+  text-align: center;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  color: #334155;
+}
+
+.pubdata-download {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  border-radius: 8px;
+  background: none;
+  color: #fff;
+  font-family: inherit;
+  cursor: pointer;
+}
+.pubdata-download:hover { background: rgba(255, 255, 255, 0.18); border-color: #fff; }
+
+
+.pubdata-pane-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+/* Slim scrollbars on both panes. The preview's horizontal bar is always
+   visible (the table is wider than the pane), so the browser default reads as
+   a heavy blue slab across the bottom of the card. */
+.pubdata-preview {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+
+.pubdata-preview::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+.pubdata-preview::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.pubdata-preview::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+.pubdata-preview::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Right pane — data preview. The pane is position:relative and the preview is
+   absolutely pinned beneath the label, so its height always matches the left
+   pane exactly instead of leaving a dead zone. */
+.pubdata-right {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 1rem 1.25rem 1.25rem;
+}
+
+.pubdata-preview-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.pubdata-preview {
+  flex: 1;
+  min-height: 0;
+  margin-top: 0.45rem;
+  overflow: auto;
+  border: 1px solid #e2e8f0;
+}
+
+.pubdata-preview table {
+  border-collapse: collapse;
+  font-size: 0.78rem;
+  min-width: 100%;
+}
+
+.pubdata-preview th {
+  position: sticky;
+  top: 0;
+  background: #f8fafc;
+  border-bottom: 1px solid #e2e8f0;
+  padding: 0.4rem 0.7rem;
+  text-align: left;
+  font-weight: 600;
+  color: #0f172a;
+  white-space: nowrap;
+}
+
+.pubdata-preview td {
+  padding: 0.22rem 0.7rem;
+  border-bottom: 1px solid #f1f5f9;
+  color: #1e293b;
+  white-space: nowrap;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --- Filter modal ------------------------------------------------------- */
+.pubdata-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2.5vh 2vw;
+  background: rgba(15, 23, 42, 0.55);
+}
+
+.pubdata-modal {
+  display: flex;
+  flex-direction: column;
+  width: min(1080px, 94vw);
+  height: min(660px, 82vh);
+  background: #fff;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.35);
+}
+
+.pubdata-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 1.25rem;
+  border-bottom: 1px solid #e2e8f0;
+  flex-shrink: 0;
+}
+
+.pubdata-modal-title { font-size: 1.05rem; font-weight: 700; color: #0f172a; }
+.pubdata-modal-sub   { font-size: 0.8rem; color: #64748b; margin-top: 0.15rem; }
+.pubdata-modal-error { color: #b91c1c; }
+
+.pubdata-modal-actions { display: flex; align-items: center; gap: 0.6rem; }
+
+.pubdata-modal-reset,
+.pubdata-modal-download {
+  padding: 0.4rem 0.95rem;
+  border-radius: 7px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.pubdata-modal-reset    { border: 1px solid #cbd5e1; background: #fff; color: #334155; }
+.pubdata-modal-download { border: none; background: #0f172a; color: #fff; }
+.pubdata-modal-reset:disabled,
+.pubdata-modal-download:disabled { opacity: 0.5; cursor: default; }
+
+.pubdata-modal-close {
+  border: none;
+  background: none;
+  font-size: 1.5rem;
+  line-height: 1;
+  color: #64748b;
+  cursor: pointer;
+  padding: 0 0.2rem;
+}
+
+/* The sheet scrolls in both directions; headers stay put. */
+.pubdata-sheet {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+
+.pubdata-sheet-empty { padding: 3rem; text-align: center; color: #64748b; font-size: 0.88rem; }
+
+.pubdata-sheet table { border-collapse: separate; border-spacing: 0; font-size: 0.76rem; }
+
+.pubdata-sheet th {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: #f1f5f9;
+  border-bottom: 1px solid #cbd5e1;
+  border-right: 1px solid #e2e8f0;
+  padding: 0.4rem 0.5rem;
+  text-align: left;
+  font-weight: 700;
+  color: #0f172a;
+  white-space: nowrap;
+}
+
+.pubdata-th-name { margin-right: 0.4rem; cursor: help; }
+
+.pubdata-th-toggle {
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: #fff;
+  color: #475569;
+  font-size: 0.55rem;
+  line-height: 1;
+  padding: 0.15rem 0.25rem;
+  cursor: pointer;
+}
+
+.pubdata-th-toggle.is-on { background: #0f172a; border-color: #0f172a; color: #fff; }
+
+.pubdata-sheet td {
+  border-bottom: 1px solid #f1f5f9;
+  border-right: 1px solid #f1f5f9;
+  padding: 0.25rem 0.5rem;
+  color: #1e293b;
+  white-space: nowrap;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Header dropdown. z-index clears the sticky header row it sits inside. */
+.pubdata-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 30;
+  width: 250px;
+  padding: 0.5rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.18);
+  font-weight: 400;
+  white-space: normal;
+}
+
+.pubdata-menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+
+.pubdata-menu-title { font-size: 0.76rem; font-weight: 700; }
+
+.pubdata-menu-reset {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 0.7rem;
+  font-weight: 600;
+  font-family: inherit;
+  color: #2563eb;
+  cursor: pointer;
+}
+
+.pubdata-menu-reset:disabled { color: #cbd5e1; cursor: default; }
+
+/* Min and Max side by side so the range block stays two lines tall. */
+.pubdata-menu-range-row { display: flex; gap: 0.4rem; }
+.pubdata-menu-range-row label { flex: 1; }
+
+/* Separates the range block from the value list beneath it. */
+.pubdata-menu-range + .pubdata-menu-search { margin-top: 0.5rem; }
+
+.pubdata-menu-search,
+.pubdata-menu-range input {
+  width: 100%;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  font-size: 0.75rem;
+  font-family: inherit;
+}
+
+.pubdata-menu-actions { display: flex; gap: 0.35rem; margin: 0.35rem 0; }
+
+.pubdata-menu-actions button,
+.pubdata-menu-range button {
+  flex: 1;
+  padding: 0.22rem;
+  border: none;
+  border-radius: 5px;
+  background: #f1f5f9;
+  color: #475569;
+  font-size: 0.72rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.pubdata-menu-actions button:disabled,
+.pubdata-menu-range button:disabled { opacity: 0.45; cursor: default; }
+
+.pubdata-menu-list { max-height: 190px; overflow: auto; scrollbar-width: thin; }
+
+.pubdata-menu-option {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.15rem 0.2rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.pubdata-menu-option:hover { background: #f1f5f9; }
+.pubdata-menu-option span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.pubdata-menu-note { font-size: 0.7rem; color: #64748b; padding: 0.25rem 0.2rem; }
+
+.pubdata-menu-range { display: flex; flex-direction: column; gap: 0.35rem; }
+.pubdata-menu-range label { font-size: 0.72rem; color: #475569; display: flex; flex-direction: column; gap: 0.15rem; }
+
+.pubdata-modal-foot {
+  flex-shrink: 0;
+  padding: 0.55rem 1.25rem;
+  border-top: 1px solid #e2e8f0;
+  background: #f8fafc;
+  font-size: 0.74rem;
+  color: #64748b;
+}
+
+/* Column description on hover of a header in the filter modal. Fixed-position
+   and drawn at modal level: inside the sheet it was clipped by that element's
+   overflow, cutting off the tooltip on right-edge columns. */
+.pubdata-th-tip {
+  position: fixed;
+  z-index: 250;
+  width: 240px;
+  padding: 0.45rem 0.6rem;
+  border-radius: 6px;
+  background: #0f172a;
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 400;
+  line-height: 1.4;
+  white-space: normal;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.28);
+  pointer-events: none;
+}
+
+
+
+/* --- IDE overrides ------------------------------------------------------
+   The library renders inside a modal here rather than as a full page. The
+   double class is deliberate: App.css caps .modal at 400px, which would
+   squeeze the two-pane layout into a single column and clip the preview. */
+.modal.data-library-modal {
+  width: min(1180px, 94vw);
+  max-width: 94vw;
+}
+
+.modal.data-library-modal .modal-body {
+  max-height: 72vh;
+  overflow-y: auto;
+}
+
+.modal.data-library-modal .pubdata-container {
+  max-width: none;
+}
+
+/* The site colours this banner with the client's brand accent. There is no
+   client here, and the IDE's own --color-accent is near-black, which reads as
+   a heavy slab — so use the same default blue the site falls back to. */
+.modal.data-library-modal .pubdata-intro-banner {
+  background: #5b9bd5;
+}
+
+/* The filter modal portals to <body> at z-index 200, which is above the
+   site's page chrome but BELOW the IDE's own .modal-overlay (1100) — so it
+   opened invisibly behind the library. Lift it over the IDE's stack. */
+.pubdata-modal-backdrop {
+  z-index: 1200;
+}

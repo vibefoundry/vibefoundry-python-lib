@@ -1109,22 +1109,96 @@ async def _after_download() -> None:
 
 @app.get("/api/data/public/catalog")
 async def get_public_data_catalog():
-    """The public dataset list, read live from the manifest so a dataset added
-    by refresh_public_data.py appears here without an IDE release."""
+    """The public dataset list, read live so a dataset added by
+    refresh_public_data.py appears here without an IDE release.
+
+    The manifest decides which datasets exist and in what order; the
+    per-dataset json carries the description, column documentation and row
+    preview. Both are fetched, exactly as the website's Public Data page does,
+    so the IDE shows the same thing rather than a thinner summary of it."""
     try:
         async with httpx.AsyncClient(timeout=_DATA_TIMEOUT) as client:
             res = await client.get(f"{PUBLIC_DATA_BASE_URL}/manifest.json")
             res.raise_for_status()
             manifest = res.json()
+
+            ids = [d.get("id") for d in manifest.get("datasets", []) if d.get("id")]
+            # Gathered concurrently, and one missing dataset must not blank the
+            # whole library — same tolerance the website page has.
+            async def fetch_one(did: str):
+                try:
+                    r = await client.get(f"{PUBLIC_DATA_BASE_URL}/{did}.json")
+                    r.raise_for_status()
+                    body = r.json()
+                    return body if isinstance(body, dict) else None
+                except Exception:
+                    return None
+
+            details = await asyncio.gather(*(fetch_one(i) for i in ids))
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=f"Could not fetch catalog: {e}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not fetch catalog: {e}")
 
-    return {
-        "datasets": manifest.get("datasets", []),
-        "generatedAt": manifest.get("generatedAt"),
-    }
+    by_id = {d["id"]: d for d in details if d and d.get("id")}
+    merged = []
+    for entry in manifest.get("datasets", []):
+        did = entry.get("id")
+        # Manifest fields win for the summary numbers; the detail json supplies
+        # description, columns and preview.
+        merged.append({**by_id.get(did, {}), **entry})
+
+    return {"datasets": merged, "generatedAt": manifest.get("generatedAt")}
+
+
+@app.get("/api/data/public/file/{dataset_id}")
+async def get_public_data_file(dataset_id: str):
+    """Stream one public parquet through the IDE.
+
+    The filter UI reads the whole file in the browser. Fetching it straight
+    from vibefoundry.ai would be cross-origin from the IDE's localhost, so it
+    comes through here instead and is same-origin to the pane. Also spares us
+    depending on range requests and CORS headers on the host."""
+    if not _valid_dataset_id(dataset_id):
+        raise HTTPException(status_code=400, detail="Invalid dataset_id")
+    try:
+        async with httpx.AsyncClient(timeout=_DATA_TIMEOUT, follow_redirects=True) as client:
+            meta_res = await client.get(f"{PUBLIC_DATA_BASE_URL}/{dataset_id}.json")
+            meta_res.raise_for_status()
+            try:
+                meta = meta_res.json()
+            except ValueError:
+                raise HTTPException(status_code=404, detail=f"No public dataset named '{dataset_id}'")
+            source_file = meta.get("sourceFile") or f"{dataset_id}.parquet"
+            url = meta.get("downloadUrl") or f"{PUBLIC_DATA_BASE_URL}/{source_file}"
+            file_res = await client.get(url)
+            file_res.raise_for_status()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not read dataset: {e}")
+
+    return Response(
+        content=file_res.content,
+        media_type="application/vnd.apache.parquet",
+        headers={"x-vf-filename": source_file},
+    )
+
+
+@app.post("/api/data/public/save-cut")
+async def save_public_data_cut(
+    file: UploadFile = File(...),
+    filename: str = Form(...),
+):
+    """Write a filtered cut, built in the browser, into input_folder/.
+
+    The full-file path downloads server-side; a cut only exists client-side
+    after filtering, so it is posted back here rather than re-derived."""
+    folder = _input_folder()
+    dest = _safe_dest(folder, filename)
+    dest.write_bytes(await file.read())
+    await _after_download()
+    return {"success": True, "filename": dest.name, "bytes": dest.stat().st_size}
 
 
 @app.post("/api/data/public/download")
