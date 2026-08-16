@@ -1049,6 +1049,240 @@ async def delete_templates():
     return {"success": True, "deleted": deleted}
 
 
+# --- Data library (public + private) ------------------------------------------
+#
+# Two catalogues, one download destination. Public datasets are static files
+# served straight off vibefoundry.ai and need no identity at all. Private
+# datasets go through /api/private-data, which re-checks the caller's identity
+# against that client's allowlist on EVERY request and streams the bytes back
+# from the client's own storage — nothing confidential is addressable by URL.
+#
+# Both land in {project}/input_folder/, created on demand, because that is
+# where scripts already look for their inputs.
+
+PUBLIC_DATA_BASE_URL = "https://vibefoundry.ai/public_data"
+PRIVATE_DATA_URL = "https://vibefoundry.ai/api/private-data"
+
+_DATA_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
+
+
+class DataDownloadRequest(BaseModel):
+    dataset_id: str
+
+
+def _valid_dataset_id(did: str) -> bool:
+    """Same shape rule as template ids. This value is interpolated into an
+    upstream URL and used as a filename stem, so anything outside
+    [a-z0-9_] is rejected rather than escaped."""
+    if not did or len(did) > 128:
+        return False
+    return all(c.islower() or c.isdigit() or c == "_" for c in did)
+
+
+def _input_folder() -> Path:
+    """The project's input_folder, created if it isn't there yet."""
+    if not state.project_folder:
+        raise HTTPException(status_code=400, detail="No project folder selected")
+    folder = state.project_folder / "input_folder"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _safe_dest(folder: Path, filename: str) -> Path:
+    """Resolve `filename` inside `folder`, refusing anything that escapes it.
+    The name comes from a remote manifest, so it is treated as untrusted."""
+    name = Path(str(filename or "")).name
+    if not name or name in (".", ".."):
+        raise HTTPException(status_code=502, detail="Upstream sent an unusable filename")
+    dest = (folder / name).resolve()
+    try:
+        dest.relative_to(folder.resolve())
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Upstream filename escapes input_folder")
+    return dest
+
+
+def _json_or_none(res: "httpx.Response") -> Optional[dict]:
+    """Parse a JSON body, or None if it isn't JSON at all. vibefoundry.ai
+    answers unknown paths with the SPA's HTML, so a body that doesn't parse
+    means we reached the site but not the service."""
+    try:
+        parsed = res.json()
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def _after_download() -> None:
+    """Refresh metadata and the file watcher so the new file shows up in the
+    tree immediately, the same way a template download does. _restart_watcher
+    only builds the watcher — it has to be started too, or the tree goes quiet
+    after the first download."""
+    generate_metadata(state.project_folder)
+    _restart_watcher()
+    if state.watcher:
+        await state.watcher.start_async()
+
+
+@app.get("/api/data/public/catalog")
+async def get_public_data_catalog():
+    """The public dataset list, read live from the manifest so a dataset added
+    by refresh_public_data.py appears here without an IDE release."""
+    try:
+        async with httpx.AsyncClient(timeout=_DATA_TIMEOUT) as client:
+            res = await client.get(f"{PUBLIC_DATA_BASE_URL}/manifest.json")
+            res.raise_for_status()
+            manifest = res.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"Could not fetch catalog: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not fetch catalog: {e}")
+
+    return {
+        "datasets": manifest.get("datasets", []),
+        "generatedAt": manifest.get("generatedAt"),
+    }
+
+
+@app.post("/api/data/public/download")
+async def download_public_data(req: DataDownloadRequest):
+    """Fetch one public dataset's parquet into {project}/input_folder/."""
+    if not _valid_dataset_id(req.dataset_id):
+        raise HTTPException(status_code=400, detail="Invalid dataset_id")
+    folder = _input_folder()
+
+    try:
+        async with httpx.AsyncClient(timeout=_DATA_TIMEOUT, follow_redirects=True) as client:
+            # The per-dataset json is what knows the parquet's filename; the
+            # manifest only carries display metadata.
+            #
+            # A single-page app answers unknown paths with index.html and a
+            # 200, so raise_for_status() cannot tell us the id was bogus —
+            # only failing to parse JSON can. Treat that as "no such dataset"
+            # rather than letting a decode error surface as a 502.
+            meta_res = await client.get(f"{PUBLIC_DATA_BASE_URL}/{req.dataset_id}.json")
+            meta_res.raise_for_status()
+            try:
+                meta = meta_res.json()
+            except ValueError:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No public dataset named '{req.dataset_id}'",
+                )
+
+            source_file = meta.get("sourceFile") or f"{req.dataset_id}.parquet"
+            url = meta.get("downloadUrl") or f"{PUBLIC_DATA_BASE_URL}/{source_file}"
+
+            dest = _safe_dest(folder, source_file)
+            file_res = await client.get(url)
+            file_res.raise_for_status()
+            dest.write_bytes(file_res.content)
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"Download failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Download failed: {e}")
+
+    await _after_download()
+    return {
+        "success": True,
+        "dataset_id": req.dataset_id,
+        "filename": dest.name,
+        "bytes": dest.stat().st_size,
+    }
+
+
+@app.get("/api/data/private/catalog")
+async def get_private_data_catalog():
+    """The signed-in user's own client datasets. Which client that is gets
+    decided server-side from their verified identity — the IDE never names a
+    client, so this can't be used to probe for other clients' data."""
+    jwt = _require_jwt()
+    try:
+        async with httpx.AsyncClient(timeout=_DATA_TIMEOUT) as client:
+            res = await client.post(
+                PRIVATE_DATA_URL,
+                headers={"Authorization": f"Bearer {jwt}"},
+                json={"action": "list"},
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach the data service: {e}")
+
+    if res.status_code in (401, 403):
+        raise HTTPException(status_code=res.status_code, detail="Not authorised for private data")
+
+    # "No data for your client" and "the data service isn't there" both arrive
+    # as a 404, and they must never look the same: reporting an empty library
+    # when the endpoint is simply missing would quietly tell a user their
+    # organisation has shared nothing. Only the service's own JSON answer
+    # counts as an authoritative empty.
+    body = _json_or_none(res)
+    if res.status_code == 404:
+        if body is not None and body.get("error") == "no_private_data":
+            return {"datasets": [], "clientName": None}
+        raise HTTPException(status_code=502, detail="The data service is unavailable")
+    if res.status_code >= 400:
+        raise HTTPException(status_code=res.status_code, detail=f"Catalog error: {res.text[:200]}")
+    if body is None:
+        raise HTTPException(status_code=502, detail="The data service returned an unreadable response")
+
+    return {
+        "datasets": body.get("datasets", []),
+        "clientName": body.get("clientName"),
+    }
+
+
+@app.post("/api/data/private/download")
+async def download_private_data(req: DataDownloadRequest):
+    """Pull one private dataset into {project}/input_folder/. Authorisation is
+    re-checked upstream on this request — a stale token gets nothing."""
+    if not _valid_dataset_id(req.dataset_id):
+        raise HTTPException(status_code=400, detail="Invalid dataset_id")
+    jwt = _require_jwt()
+    folder = _input_folder()
+
+    try:
+        async with httpx.AsyncClient(timeout=_DATA_TIMEOUT) as client:
+            res = await client.post(
+                PRIVATE_DATA_URL,
+                headers={"Authorization": f"Bearer {jwt}"},
+                json={"action": "file", "datasetId": req.dataset_id},
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach the data service: {e}")
+
+    if res.status_code in (401, 403):
+        raise HTTPException(status_code=res.status_code, detail="Not authorised for this dataset")
+    if res.status_code >= 400:
+        body = _json_or_none(res)
+        if body is None:
+            raise HTTPException(status_code=502, detail="The data service is unavailable")
+        raise HTTPException(
+            status_code=res.status_code,
+            detail=f"Download failed: {body.get('error', 'unknown error')}",
+        )
+
+    # Never write the SPA's HTML into input_folder as if it were a dataset:
+    # a 200 that isn't parquet means we reached the site, not the service.
+    if res.headers.get("content-type", "").startswith("text/html"):
+        raise HTTPException(status_code=502, detail="The data service is unavailable")
+
+    # The service reports the real filename; fall back to the id so a missing
+    # header still lands something sensible rather than failing the download.
+    filename = res.headers.get("x-vf-filename") or f"{req.dataset_id}.parquet"
+    dest = _safe_dest(folder, filename)
+    dest.write_bytes(res.content)
+
+    await _after_download()
+    return {
+        "success": True,
+        "dataset_id": req.dataset_id,
+        "filename": dest.name,
+        "bytes": dest.stat().st_size,
+    }
+
+
 @app.get("/api/scripts")
 async def list_scripts():
     """List available scripts"""

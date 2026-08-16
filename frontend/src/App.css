@@ -3571,6 +3571,26 @@ body {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
 }
 
+/* Data library modal — reuses .view-tabs/.view-tab for the segmented control,
+   so only placement and the two data-specific bits live here. */
+.data-tabs {
+  margin: 0 20px;
+  align-self: flex-start;
+}
+
+.data-card-facts {
+  color: var(--color-text-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+.data-signin-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 0;
+}
+
 /* Preview Pane */
 .preview-pane {
   display: flex;

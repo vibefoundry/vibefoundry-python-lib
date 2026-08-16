@@ -3,6 +3,7 @@ import FileTree from './components/FileTree'
 import FileViewer from './components/FileViewer'
 import FolderPicker from './components/FolderPicker'
 import TemplatePickerModal from './components/TemplatePickerModal'
+import DataPickerModal from './components/DataPickerModal'
 import LogsModal from './components/LogsModal'
 import { record, installErrorCapture } from './utils/diagnostics'
 import {
@@ -140,6 +141,14 @@ function App() {
   const [showBuildModal, setShowBuildModal] = useState(false)
   const [isScaffolding, setIsScaffolding] = useState(false)
   const [showTemplatesMenu, setShowTemplatesMenu] = useState(false)
+  const [showDataModal, setShowDataModal] = useState(false)
+  const [dataTab, setDataTab] = useState('public')
+  const [dataCatalog, setDataCatalog] = useState(null)
+  const [dataCatalogError, setDataCatalogError] = useState(null)
+  const [loadingDataCatalog, setLoadingDataCatalog] = useState(false)
+  const [dataNeedsSignIn, setDataNeedsSignIn] = useState(false)
+  const [isDownloadingData, setIsDownloadingData] = useState(false)
+  const [downloadingDataId, setDownloadingDataId] = useState(null)
   const [showDownloadModal, setShowDownloadModal] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [isDownloading, setIsDownloading] = useState(false)
@@ -833,6 +842,70 @@ function App() {
     }
   }
 
+  const loadDataCatalog = useCallback(async (which) => {
+    setLoadingDataCatalog(true)
+    setDataCatalogError(null)
+    setDataNeedsSignIn(false)
+    setDataCatalog(null)
+    try {
+      const res = await fetch(`/api/data/${which}/catalog`)
+      // Only the private tab can be gated; treat 401/403 as "sign in", which
+      // is a prompt rather than a failure.
+      if (res.status === 401 || res.status === 403) {
+        setDataNeedsSignIn(true)
+        return
+      }
+      if (!res.ok) throw new Error(`Catalog fetch failed (${res.status})`)
+      setDataCatalog(await res.json())
+    } catch (err) {
+      console.error('Failed to load data catalog:', err)
+      setDataCatalogError(
+        which === 'private'
+          ? 'Could not load your private datasets.'
+          : 'Could not load the public data catalog.'
+      )
+    } finally {
+      setLoadingDataCatalog(false)
+    }
+  }, [])
+
+  const openDataModal = () => {
+    setShowDataModal(true)
+    setDataTab('public')
+    loadDataCatalog('public')
+  }
+
+  const handleDataTabChange = (which) => {
+    setDataTab(which)
+    loadDataCatalog(which)
+  }
+
+  const handleDownloadData = async (datasetId) => {
+    if (!projectPath || !canWrite || isDownloadingData) return
+    setIsDownloadingData(true)
+    setDownloadingDataId(datasetId)
+    try {
+      const res = await fetch(`/api/data/${dataTab}/download`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dataset_id: datasetId }),
+      })
+      if (res.status === 401 || res.status === 403) {
+        setDataNeedsSignIn(true)
+        return
+      }
+      if (!res.ok) throw new Error(`Download failed (${res.status})`)
+      await handleRefresh()
+      setShowDataModal(false)
+    } catch (err) {
+      console.error('Failed to download dataset:', err)
+      setDataCatalogError('That download did not complete. Try again.')
+    } finally {
+      setIsDownloadingData(false)
+      setDownloadingDataId(null)
+    }
+  }
+
   const handleDeleteTemplates = async () => {
     if (!projectPath || !canWrite || isDeleting) return
     setIsDeleting(true)
@@ -1041,6 +1114,13 @@ function App() {
                 </div>
               )}
             </div>
+            <button
+              className="btn-flat"
+              onClick={openDataModal}
+              disabled={!projectPath || !canWrite}
+            >
+              Data
+            </button>
           </div>
           <div className="top-bar-section top-bar-center" />
           <div className="top-bar-section top-bar-right">
@@ -1232,6 +1312,21 @@ function App() {
         downloadingId={downloadingId}
         onSelect={handleDownloadTemplate}
         onClose={() => setShowDownloadModal(false)}
+      />
+
+      <DataPickerModal
+        open={showDataModal}
+        tab={dataTab}
+        onTabChange={handleDataTabChange}
+        catalog={dataCatalog}
+        catalogError={dataCatalogError}
+        loadingCatalog={loadingDataCatalog}
+        isDownloading={isDownloadingData}
+        downloadingId={downloadingDataId}
+        needsSignIn={dataNeedsSignIn}
+        onSignIn={startSignIn}
+        onSelect={handleDownloadData}
+        onClose={() => setShowDataModal(false)}
       />
 
       {showDeleteConfirm && (
