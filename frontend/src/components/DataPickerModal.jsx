@@ -31,8 +31,13 @@ function DatasetRow({ dataset, isDownloading, downloadingId, onSelect }) {
       <div className="template-card-titles">
         <div className="template-card-title-row">
           <h3>{dataset.title || dataset.id}</h3>
-          {dataset.category && (
-            <span className="template-card-track">{dataset.category}</span>
+          {/* Public datasets carry a category; private ones are tagged with
+              the client they belong to, which matters when someone can see
+              more than one client's data. */}
+          {(dataset.category || dataset.clientName) && (
+            <span className="template-card-track">
+              {dataset.category || dataset.clientName}
+            </span>
           )}
         </div>
         {dataset.description && (
