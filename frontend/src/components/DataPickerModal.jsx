@@ -69,8 +69,9 @@ export default function DataPickerModal({
   loadingCatalog,
   isDownloading,
   downloadingId,
-  needsSignIn,
-  onSignIn,
+  onOpenDrive,
+  driveBusy,
+  driveError,
   onSelect,
   onClose,
 }) {
@@ -111,34 +112,48 @@ export default function DataPickerModal({
             Downloads land in <code>input_folder/</code>.
           </p>
 
-          {loadingCatalog && <p>Loading datasets…</p>}
-
-          {/* Not signed in is a prompt, not an error — the private tab is
-              expected to look like this until they authenticate. */}
-          {needsSignIn && !loadingCatalog && (
+          {/* Private data is whatever Google says you may see. There is no
+              VibeFoundry catalogue of it, no allowlist to keep in step with
+              the client's own sharing, and no credential on our side — you
+              sign into Google and pick, and Google decides. */}
+          {tab === 'private' && (
             <div className="data-signin-prompt">
               <p className="modal-note">
-                Sign in to see the data your organisation has shared with you.
+                Your private data lives in Google Drive. Sign in with Google and
+                pick the files you want — you'll only see what's been shared
+                with you.
               </p>
-              <button className="btn-primary" onClick={onSignIn}>Sign in</button>
+              <button
+                className="btn-primary"
+                onClick={onOpenDrive}
+                disabled={driveBusy}
+              >
+                {driveBusy ? 'Waiting for Google…' : 'Choose files from Google Drive'}
+              </button>
+              {driveBusy && (
+                <p className="modal-note">
+                  A browser tab is open. Pick your files there and they'll appear here.
+                </p>
+              )}
+              {driveError && (
+                <p className="modal-note" style={{ color: '#b91c1c' }}>{driveError}</p>
+              )}
             </div>
           )}
 
-          {catalogError && !needsSignIn && (
+          {tab === 'public' && loadingCatalog && <p>Loading datasets…</p>}
+
+          {tab === 'public' && catalogError && (
             <p className="modal-note" style={{ color: '#b91c1c' }}>
               {catalogError}
             </p>
           )}
 
-          {idle && !needsSignIn && datasets.length === 0 && (
-            <p className="modal-note">
-              {tab === 'private'
-                ? 'No private datasets have been shared with your organisation.'
-                : 'No datasets available.'}
-            </p>
+          {tab === 'public' && idle && datasets.length === 0 && (
+            <p className="modal-note">No datasets available.</p>
           )}
 
-          {datasets.length > 0 && (
+          {tab === 'public' && datasets.length > 0 && (
             <div className="template-row-list">
               {datasets.map((d) => (
                 <DatasetRow

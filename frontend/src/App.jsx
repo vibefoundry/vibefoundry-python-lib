@@ -146,7 +146,8 @@ function App() {
   const [dataCatalog, setDataCatalog] = useState(null)
   const [dataCatalogError, setDataCatalogError] = useState(null)
   const [loadingDataCatalog, setLoadingDataCatalog] = useState(false)
-  const [dataNeedsSignIn, setDataNeedsSignIn] = useState(false)
+  const [driveBusy, setDriveBusy] = useState(false)
+  const [driveError, setDriveError] = useState(null)
   const [isDownloadingData, setIsDownloadingData] = useState(false)
   const [downloadingDataId, setDownloadingDataId] = useState(null)
   const [showDownloadModal, setShowDownloadModal] = useState(false)
@@ -843,27 +844,18 @@ function App() {
   }
 
   const loadDataCatalog = useCallback(async (which) => {
+    // Private data has no catalogue — it is whatever Google shows the user.
+    if (which !== 'public') return
     setLoadingDataCatalog(true)
     setDataCatalogError(null)
-    setDataNeedsSignIn(false)
     setDataCatalog(null)
     try {
-      const res = await fetch(`/api/data/${which}/catalog`)
-      // Only the private tab can be gated; treat 401/403 as "sign in", which
-      // is a prompt rather than a failure.
-      if (res.status === 401 || res.status === 403) {
-        setDataNeedsSignIn(true)
-        return
-      }
+      const res = await fetch('/api/data/public/catalog')
       if (!res.ok) throw new Error(`Catalog fetch failed (${res.status})`)
       setDataCatalog(await res.json())
     } catch (err) {
       console.error('Failed to load data catalog:', err)
-      setDataCatalogError(
-        which === 'private'
-          ? 'Could not load your private datasets.'
-          : 'Could not load the public data catalog.'
-      )
+      setDataCatalogError('Could not load the public data catalog.')
     } finally {
       setLoadingDataCatalog(false)
     }
@@ -890,10 +882,6 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dataset_id: datasetId }),
       })
-      if (res.status === 401 || res.status === 403) {
-        setDataNeedsSignIn(true)
-        return
-      }
       if (!res.ok) throw new Error(`Download failed (${res.status})`)
       await handleRefresh()
       setShowDataModal(false)
@@ -904,6 +892,51 @@ function App() {
       setIsDownloadingData(false)
       setDownloadingDataId(null)
     }
+  }
+
+  // Google's picker runs in a browser tab, so the work finishes outside this
+  // window. Kick it off, then poll for the result the callback records.
+  const handleOpenDrive = async () => {
+    if (driveBusy) return
+    setDriveError(null)
+    setDriveBusy(true)
+    let baseline = null
+    try {
+      const before = await fetch('/api/data/private/drive-result')
+      baseline = before.ok ? (await before.json()).at : null
+
+      const res = await fetch('/api/data/private/drive-start', { method: 'POST' })
+      if (!res.ok) throw new Error(`Could not start (${res.status})`)
+      const { url } = await res.json()
+      window.open(url, '_blank', 'noopener')
+    } catch (err) {
+      console.error('Drive start failed:', err)
+      setDriveError('Could not open Google Drive.')
+      setDriveBusy(false)
+      return
+    }
+
+    // Give them a few minutes to sign in and pick; stop waiting after that
+    // rather than spinning forever if they abandon the tab.
+    const deadline = Date.now() + 5 * 60 * 1000
+    const poll = setInterval(async () => {
+      if (Date.now() > deadline) {
+        clearInterval(poll)
+        setDriveBusy(false)
+        return
+      }
+      try {
+        const res = await fetch('/api/data/private/drive-result')
+        if (!res.ok) return
+        const data = await res.json()
+        if (data.at && data.at !== baseline) {
+          clearInterval(poll)
+          setDriveBusy(false)
+          await handleRefresh()
+          setShowDataModal(false)
+        }
+      } catch { /* transient; keep polling */ }
+    }, 1500)
   }
 
   const handleDeleteTemplates = async () => {
@@ -1323,8 +1356,9 @@ function App() {
         loadingCatalog={loadingDataCatalog}
         isDownloading={isDownloadingData}
         downloadingId={downloadingDataId}
-        needsSignIn={dataNeedsSignIn}
-        onSignIn={startSignIn}
+        onOpenDrive={handleOpenDrive}
+        driveBusy={driveBusy}
+        driveError={driveError}
         onSelect={handleDownloadData}
         onClose={() => setShowDataModal(false)}
       />

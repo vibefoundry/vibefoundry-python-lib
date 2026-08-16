@@ -73,7 +73,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 import polars as pl
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -1280,6 +1280,140 @@ async def download_private_data(req: DataDownloadRequest):
         "dataset_id": req.dataset_id,
         "filename": dest.name,
         "bytes": dest.stat().st_size,
+    }
+
+
+# --- Private data via the user's own Google Drive --------------------------
+#
+# No VibeFoundry credential anywhere in this path. The user signs into Google
+# in their own browser, Google shows them only what has been shared with them,
+# and they pick what comes across. Whether they may read a file is decided by
+# Google against that file's sharing settings — settings the owning client
+# manages themselves. We never hold a key that could read their Drive, so
+# there is nothing on our side to leak, rotate, or over-grant.
+#
+# Why a browser round trip: Google will not redirect an OAuth web client to a
+# 127.0.0.1 origin, and a corporate IdP refuses to render inside a webview. So
+# the IDE pops a tab to vibefoundry.ai/ide-data, which runs the picker and
+# redirects back here with a short-lived access token and the chosen file ids.
+
+DRIVE_LANDING_URL = "https://vibefoundry.ai/ide-data"
+DRIVE_API_URL = "https://www.googleapis.com/drive/v3/files"
+
+# Same CSRF shape as sign-in: a nonce we minted, good once, for ten minutes.
+_pending_drive_states: dict[str, float] = {}
+
+
+def _purge_expired_drive_states() -> None:
+    now = time.time()
+    for s in [s for s, exp in _pending_drive_states.items() if exp < now]:
+        _pending_drive_states.pop(s, None)
+
+
+@app.post("/api/data/private/drive-start")
+async def drive_start(request: Request):
+    """Mint a CSRF state and return the URL the IDE should open."""
+    if not state.project_folder:
+        raise HTTPException(status_code=400, detail="No project folder selected")
+    _purge_expired_drive_states()
+    nonce = secrets.token_urlsafe(32)
+    _pending_drive_states[nonce] = time.time() + _AUTH_STATE_TTL_SECONDS
+
+    host = request.headers.get("host", "127.0.0.1:8765")
+    callback = f"http://{host}/api/data/private/drive-callback"
+    return {
+        "url": (
+            f"{DRIVE_LANDING_URL}"
+            f"?state={nonce}"
+            f"&callback={urllib.parse.quote(callback, safe='')}"
+        )
+    }
+
+
+async def _fetch_drive_file(client: "httpx.AsyncClient", token: str, file_id: str) -> tuple[str, bytes]:
+    """Name + bytes for one Drive file, read as the signed-in user."""
+    headers = {"Authorization": f"Bearer {token}"}
+    meta = await client.get(f"{DRIVE_API_URL}/{file_id}", headers=headers, params={"fields": "name,mimeType"})
+    meta.raise_for_status()
+    info = meta.json()
+
+    blob = await client.get(f"{DRIVE_API_URL}/{file_id}", headers=headers, params={"alt": "media"})
+    blob.raise_for_status()
+    return info.get("name") or file_id, blob.content
+
+
+@app.get("/api/data/private/drive-callback")
+async def drive_callback(
+    token: str = "",
+    ids: str = "",
+    # Aliased because a parameter literally named `state` would shadow the
+    # module-level app state this handler needs for the project folder.
+    csrf: str = Query("", alias="state"),
+):
+    """Receive the picker result and pull each chosen file into input_folder.
+
+    The access token is used here and then dropped — never written to disk.
+    It is the user's own, minted by Google, good for about an hour, and scoped
+    to just the files they picked."""
+    if not token or not csrf:
+        return HTMLResponse(_auth_callback_html(error="Missing token or state in callback URL."), status_code=400)
+
+    _purge_expired_drive_states()
+    if csrf not in _pending_drive_states:
+        return HTMLResponse(
+            _auth_callback_html(error="Invalid or expired request. Start again from the IDE."),
+            status_code=400,
+        )
+    _pending_drive_states.pop(csrf, None)
+
+    file_ids = [i for i in (ids or "").split(",") if i.strip()]
+    if not file_ids:
+        return HTMLResponse(_auth_callback_html(error="No files were selected."), status_code=400)
+
+    try:
+        folder = _input_folder()
+    except HTTPException as e:
+        return HTMLResponse(_auth_callback_html(error=str(e.detail)), status_code=e.status_code)
+
+    written: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=_DATA_TIMEOUT, follow_redirects=True) as client:
+            for file_id in file_ids:
+                name, content = await _fetch_drive_file(client, token, file_id)
+                dest = _safe_dest(folder, name)
+                dest.write_bytes(content)
+                written.append(dest.name)
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        # 403/404 here is Google enforcing the file's own sharing settings.
+        # That is the wall doing its job, not a bug on our side.
+        msg = (
+            "Google would not release that file. Check it is shared with the account you signed in as."
+            if code in (401, 403, 404)
+            else f"Google returned {code}."
+        )
+        return HTMLResponse(_auth_callback_html(error=msg), status_code=502)
+    except HTTPException as e:
+        return HTMLResponse(_auth_callback_html(error=str(e.detail)), status_code=e.status_code)
+    except Exception as e:
+        return HTMLResponse(_auth_callback_html(error=f"Download failed: {e}"), status_code=502)
+
+    await _after_download()
+    _drive_last_result.clear()
+    _drive_last_result.update({"files": written, "at": time.time()})
+    return HTMLResponse(_auth_callback_html())
+
+
+# The pane polls this so it can close the modal and say what arrived — the
+# download finishes in the browser tab, not in the IDE's own request.
+_drive_last_result: dict = {}
+
+
+@app.get("/api/data/private/drive-result")
+async def drive_result():
+    return {
+        "files": _drive_last_result.get("files", []),
+        "at": _drive_last_result.get("at"),
     }
 
 
