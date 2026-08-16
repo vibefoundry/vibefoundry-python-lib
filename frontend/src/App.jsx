@@ -148,8 +148,6 @@ function App() {
   const [catalog, setCatalog] = useState(null)
   const [catalogError, setCatalogError] = useState(null)
   const [loadingCatalog, setLoadingCatalog] = useState(false)
-  const [showPreview, setShowPreview] = useState(false)
-  const [previewUrl, setPreviewUrl] = useState(() => localStorage.getItem('previewUrl') || '')
   const [deletedFileToast, setDeletedFileToast] = useState(null)
   // Starts CLOSED and is opened only if the backend turns out to have no folder
   // (see the /api/folder/info effect). Starting it open flashed the picker over
@@ -224,11 +222,24 @@ function App() {
       handle.removeEventListener('pointermove', onMove)
       handle.removeEventListener('pointerup', onEnd)
       handle.removeEventListener('pointercancel', onEnd)
+      handle.removeEventListener('lostpointercapture', onEnd)
+      window.removeEventListener('pointerup', onEnd)
+      window.removeEventListener('pointercancel', onEnd)
+      window.removeEventListener('blur', onEnd)
     }
 
     handle.addEventListener('pointermove', onMove)
     handle.addEventListener('pointerup', onEnd)
     handle.addEventListener('pointercancel', onEnd)
+    // Capture can be lost without any pointerup reaching the handle — the
+    // pointer leaves an embedded webview's bounds, or the host app grabs it
+    // for its own pane resize. Without these the drag never ends, and the
+    // full-viewport .resize-capture-overlay latches on and eats every click,
+    // which reads as a frozen IDE.
+    handle.addEventListener('lostpointercapture', onEnd)
+    window.addEventListener('pointerup', onEnd)
+    window.addEventListener('pointercancel', onEnd)
+    window.addEventListener('blur', onEnd)
   }, [])
 
   // Helper to get a hash of the tree structure including modification times
@@ -1031,22 +1042,7 @@ function App() {
               )}
             </div>
           </div>
-          <div className="top-bar-section top-bar-center">
-            <div className="view-tabs">
-              <button
-                className={`view-tab ${!showPreview ? 'active' : ''}`}
-                onClick={() => setShowPreview(false)}
-              >
-                Files
-              </button>
-              <button
-                className={`view-tab ${showPreview ? 'active' : ''}`}
-                onClick={() => setShowPreview(true)}
-              >
-                Preview
-              </button>
-            </div>
-          </div>
+          <div className="top-bar-section top-bar-center" />
           <div className="top-bar-section top-bar-right">
             {/* Zoom lives in the app because embeds can't have it any other
                 way: inside a host pane Cmd+/- belongs to the HOST app and
@@ -1145,50 +1141,7 @@ function App() {
             </div>
           )}
 
-          {showPreview ? (
-            <div className="preview-pane">
-              <div className="preview-url-bar">
-                <input
-                  type="text"
-                  className="preview-url-input"
-                  placeholder="Enter URL (e.g., http://localhost:3000)"
-                  value={previewUrl}
-                  onChange={(e) => {
-                    setPreviewUrl(e.target.value)
-                    localStorage.setItem('previewUrl', e.target.value)
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      // Force iframe refresh by toggling key
-                      const iframe = document.querySelector('.preview-iframe')
-                      if (iframe) iframe.src = previewUrl
-                    }
-                  }}
-                />
-                <button
-                  className="btn-flat"
-                  onClick={() => {
-                    const iframe = document.querySelector('.preview-iframe')
-                    if (iframe) iframe.src = previewUrl
-                  }}
-                >
-                  Go
-                </button>
-              </div>
-              {previewUrl ? (
-                <iframe
-                  className="preview-iframe"
-                  src={previewUrl}
-                  title="App Preview"
-                  style={{ pointerEvents: isResizing ? 'none' : 'auto' }}
-                />
-              ) : (
-                <div className="preview-placeholder">
-                  Enter a URL above to preview your app
-                </div>
-              )}
-            </div>
-          ) : loading ? (
+          {loading ? (
             <div className="loading">Loading...</div>
           ) : fileContent ? (
             <FileViewer
