@@ -135,6 +135,11 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [folderName, setFolderName] = useState(null)
   const [sidebarWidth, setSidebarWidth] = useState(320)
+  // The top bar's left section is locked to the sidebar width, so dragging the
+  // sidebar narrower than its buttons pushed them out past the divider. They
+  // still painted (overflow is visible) but the content pane sat on top, so
+  // Public Data looked present and refused to click.
+  const topBarLeftRef = useRef(null)
   const [isResizing, setIsResizing] = useState(false)
   const [canWrite, setCanWrite] = useState(false)
   const [saveStatus, setSaveStatus] = useState(null) // 'saving', 'saved', 'error'
@@ -199,6 +204,21 @@ function App() {
   // Sidebar resize handlers - use refs to avoid stale closures
   const isResizingRef = useRef(false)
 
+  /** Narrowest the sidebar may get: whatever the toolbar actually needs.
+   *  Measured rather than hardcoded — the project name sits in that row, so
+   *  the figure changes with the folder you open and with any button added
+   *  later. Falls back to the old floor before the bar has mounted. */
+  const minSidebarWidth = useCallback(() => {
+    const el = topBarLeftRef.current
+    if (!el) return 200
+    const cs = window.getComputedStyle(el)
+    const gap = parseFloat(cs.columnGap || cs.gap) || 0
+    const pad = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0)
+    const kids = [...el.children]
+    const content = kids.reduce((sum, c) => sum + c.getBoundingClientRect().width, 0)
+    return Math.ceil(content + gap * Math.max(0, kids.length - 1) + pad)
+  }, [])
+
   const handleResizeStart = useCallback((e) => {
     e.preventDefault()
     const handle = e.currentTarget
@@ -214,7 +234,7 @@ function App() {
     const onMove = (ev) => {
       if (!isResizingRef.current) return
       ev.preventDefault()
-      const newWidth = Math.max(200, Math.min(600, ev.clientX))
+      const newWidth = Math.max(minSidebarWidth(), Math.min(600, ev.clientX))
       setSidebarWidth(newWidth)
     }
 
@@ -245,7 +265,15 @@ function App() {
     window.addEventListener('pointerup', onEnd)
     window.addEventListener('pointercancel', onEnd)
     window.addEventListener('blur', onEnd)
-  }, [])
+  }, [minSidebarWidth])
+
+  // A long project name can make the toolbar wider than the default sidebar,
+  // so enforce the floor once it has rendered as well as during a drag.
+  useEffect(() => {
+    if (!folderName) return
+    const floor = minSidebarWidth()
+    setSidebarWidth((w) => (w < floor ? floor : w))
+  }, [folderName, minSidebarWidth])
 
   // Helper to get a hash of the tree structure including modification times
   const getTreeHash = (nodes) => {
@@ -1027,7 +1055,7 @@ function App() {
       {/* Unified Top Bar */}
       {canWrite && tree.length > 0 && (
         <div className="top-bar">
-          <div className="top-bar-section top-bar-left" style={{ width: sidebarWidth }}>
+          <div className="top-bar-section top-bar-left" ref={topBarLeftRef} style={{ width: sidebarWidth }}>
             <span className="top-bar-title">{folderName || 'Project'}</span>
             <button className="btn-flat" onClick={() => setShowBuildModal(true)}>
               Build

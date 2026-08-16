@@ -75,6 +75,13 @@ body {
   flex-shrink: 0;
 }
 
+/* Keep the toolbar's own controls at their intrinsic width. If they were
+   allowed to shrink, measuring them to derive the sidebar's minimum width
+   would under-report and let the sidebar squeeze them out again. */
+.top-bar-left > * {
+  flex-shrink: 0;
+}
+
 .top-bar-center {
   flex: 1;
 }

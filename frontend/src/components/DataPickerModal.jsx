@@ -76,7 +76,6 @@ export default function DataPickerModal({
   onClose,
 }) {
   const [filtering, setFiltering] = useState(null)
-  const [savedName, setSavedName] = useState(null)
 
   if (!open) return null
 
@@ -93,9 +92,8 @@ export default function DataPickerModal({
 
         <div className="modal-body">
           <p className="modal-note">
-            {savedName
-              ? `Saved ${savedName} to input_folder/.`
-              : 'Downloads land in input_folder/. Filter first to take just the cut you need.'}
+            Downloads land in <code>input_folder/</code>. Filter first to take
+            just the cut you need.
           </p>
 
           {loadingCatalog && <p>Loading datasets…</p>}
@@ -132,8 +130,8 @@ export default function DataPickerModal({
           onClose={() => setFiltering(null)}
           onSaved={(name) => {
             setFiltering(null)
-            setSavedName(name)
-            onSaved?.()
+            onSaved?.(name)
+            onClose()
           }}
         />
       )}
