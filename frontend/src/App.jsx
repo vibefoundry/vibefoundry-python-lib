@@ -142,12 +142,9 @@ function App() {
   const [isScaffolding, setIsScaffolding] = useState(false)
   const [showTemplatesMenu, setShowTemplatesMenu] = useState(false)
   const [showDataModal, setShowDataModal] = useState(false)
-  const [dataTab, setDataTab] = useState('public')
   const [dataCatalog, setDataCatalog] = useState(null)
   const [dataCatalogError, setDataCatalogError] = useState(null)
   const [loadingDataCatalog, setLoadingDataCatalog] = useState(false)
-  const [driveBusy, setDriveBusy] = useState(false)
-  const [driveError, setDriveError] = useState(null)
   const [isDownloadingData, setIsDownloadingData] = useState(false)
   const [downloadingDataId, setDownloadingDataId] = useState(null)
   const [showDownloadModal, setShowDownloadModal] = useState(false)
@@ -843,9 +840,7 @@ function App() {
     }
   }
 
-  const loadDataCatalog = useCallback(async (which) => {
-    // Private data has no catalogue — it is whatever Google shows the user.
-    if (which !== 'public') return
+  const loadDataCatalog = useCallback(async () => {
     setLoadingDataCatalog(true)
     setDataCatalogError(null)
     setDataCatalog(null)
@@ -863,13 +858,7 @@ function App() {
 
   const openDataModal = () => {
     setShowDataModal(true)
-    setDataTab('public')
-    loadDataCatalog('public')
-  }
-
-  const handleDataTabChange = (which) => {
-    setDataTab(which)
-    loadDataCatalog(which)
+    loadDataCatalog()
   }
 
   const handleDownloadData = async (datasetId) => {
@@ -877,7 +866,7 @@ function App() {
     setIsDownloadingData(true)
     setDownloadingDataId(datasetId)
     try {
-      const res = await fetch(`/api/data/${dataTab}/download`, {
+      const res = await fetch('/api/data/public/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dataset_id: datasetId }),
@@ -892,51 +881,6 @@ function App() {
       setIsDownloadingData(false)
       setDownloadingDataId(null)
     }
-  }
-
-  // Google's picker runs in a browser tab, so the work finishes outside this
-  // window. Kick it off, then poll for the result the callback records.
-  const handleOpenDrive = async () => {
-    if (driveBusy) return
-    setDriveError(null)
-    setDriveBusy(true)
-    let baseline = null
-    try {
-      const before = await fetch('/api/data/private/drive-result')
-      baseline = before.ok ? (await before.json()).at : null
-
-      const res = await fetch('/api/data/private/drive-start', { method: 'POST' })
-      if (!res.ok) throw new Error(`Could not start (${res.status})`)
-      const { url } = await res.json()
-      window.open(url, '_blank', 'noopener')
-    } catch (err) {
-      console.error('Drive start failed:', err)
-      setDriveError('Could not open Google Drive.')
-      setDriveBusy(false)
-      return
-    }
-
-    // Give them a few minutes to sign in and pick; stop waiting after that
-    // rather than spinning forever if they abandon the tab.
-    const deadline = Date.now() + 5 * 60 * 1000
-    const poll = setInterval(async () => {
-      if (Date.now() > deadline) {
-        clearInterval(poll)
-        setDriveBusy(false)
-        return
-      }
-      try {
-        const res = await fetch('/api/data/private/drive-result')
-        if (!res.ok) return
-        const data = await res.json()
-        if (data.at && data.at !== baseline) {
-          clearInterval(poll)
-          setDriveBusy(false)
-          await handleRefresh()
-          setShowDataModal(false)
-        }
-      } catch { /* transient; keep polling */ }
-    }, 1500)
   }
 
   const handleDeleteTemplates = async () => {
@@ -1152,7 +1096,7 @@ function App() {
               onClick={openDataModal}
               disabled={!projectPath || !canWrite}
             >
-              Data
+              Public Data
             </button>
           </div>
           <div className="top-bar-section top-bar-center" />
@@ -1349,16 +1293,11 @@ function App() {
 
       <DataPickerModal
         open={showDataModal}
-        tab={dataTab}
-        onTabChange={handleDataTabChange}
         catalog={dataCatalog}
         catalogError={dataCatalogError}
         loadingCatalog={loadingDataCatalog}
         isDownloading={isDownloadingData}
         downloadingId={downloadingDataId}
-        onOpenDrive={handleOpenDrive}
-        driveBusy={driveBusy}
-        driveError={driveError}
         onSelect={handleDownloadData}
         onClose={() => setShowDataModal(false)}
       />

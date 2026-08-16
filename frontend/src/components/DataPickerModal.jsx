@@ -1,13 +1,7 @@
-// Browse the data library and pull a dataset straight into input_folder/.
+// Browse the public data library and pull a dataset into input_folder/.
 //
-// Two tabs over the same shape. Public datasets need no identity at all;
-// private ones are the signed-in user's own client data, and the server
-// decides which client that is — this component never names one.
-
-const TABS = [
-  { key: 'public', label: 'Public Data' },
-  { key: 'private', label: 'Private Data' },
-]
+// Public files only: no identity, no token, no gate. Same card shape as the
+// Public Data page on vibefoundry.ai, so the two read as one library.
 
 function formatSize(mb) {
   if (typeof mb !== 'number' || !isFinite(mb)) return null
@@ -31,13 +25,8 @@ function DatasetRow({ dataset, isDownloading, downloadingId, onSelect }) {
       <div className="template-card-titles">
         <div className="template-card-title-row">
           <h3>{dataset.title || dataset.id}</h3>
-          {/* Public datasets carry a category; private ones are tagged with
-              the client they belong to, which matters when someone can see
-              more than one client's data. */}
-          {(dataset.category || dataset.clientName) && (
-            <span className="template-card-track">
-              {dataset.category || dataset.clientName}
-            </span>
+          {dataset.category && (
+            <span className="template-card-track">{dataset.category}</span>
           )}
         </div>
         {dataset.description && (
@@ -62,16 +51,11 @@ function DatasetRow({ dataset, isDownloading, downloadingId, onSelect }) {
 
 export default function DataPickerModal({
   open,
-  tab,
-  onTabChange,
   catalog,
   catalogError,
   loadingCatalog,
   isDownloading,
   downloadingId,
-  onOpenDrive,
-  driveBusy,
-  driveError,
   onSelect,
   onClose,
 }) {
@@ -87,24 +71,11 @@ export default function DataPickerModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="modal-header">
-          <h3>Data Library</h3>
+          <h3>Public Data</h3>
           <button
             className="modal-close"
             onClick={() => !isDownloading && onClose()}
           >×</button>
-        </div>
-
-        <div className="view-tabs data-tabs">
-          {TABS.map((t) => (
-            <button
-              key={t.key}
-              className={`view-tab ${tab === t.key ? 'active' : ''}`}
-              onClick={() => !isDownloading && onTabChange(t.key)}
-              disabled={isDownloading}
-            >
-              {t.label}
-            </button>
-          ))}
         </div>
 
         <div className="modal-body">
@@ -112,48 +83,19 @@ export default function DataPickerModal({
             Downloads land in <code>input_folder/</code>.
           </p>
 
-          {/* Private data is whatever Google says you may see. There is no
-              VibeFoundry catalogue of it, no allowlist to keep in step with
-              the client's own sharing, and no credential on our side — you
-              sign into Google and pick, and Google decides. */}
-          {tab === 'private' && (
-            <div className="data-signin-prompt">
-              <p className="modal-note">
-                Your private data lives in Google Drive. Sign in with Google and
-                pick the files you want — you'll only see what's been shared
-                with you.
-              </p>
-              <button
-                className="btn-primary"
-                onClick={onOpenDrive}
-                disabled={driveBusy}
-              >
-                {driveBusy ? 'Waiting for Google…' : 'Choose files from Google Drive'}
-              </button>
-              {driveBusy && (
-                <p className="modal-note">
-                  A browser tab is open. Pick your files there and they'll appear here.
-                </p>
-              )}
-              {driveError && (
-                <p className="modal-note" style={{ color: '#b91c1c' }}>{driveError}</p>
-              )}
-            </div>
-          )}
+          {loadingCatalog && <p>Loading datasets…</p>}
 
-          {tab === 'public' && loadingCatalog && <p>Loading datasets…</p>}
-
-          {tab === 'public' && catalogError && (
+          {catalogError && (
             <p className="modal-note" style={{ color: '#b91c1c' }}>
               {catalogError}
             </p>
           )}
 
-          {tab === 'public' && idle && datasets.length === 0 && (
+          {idle && datasets.length === 0 && (
             <p className="modal-note">No datasets available.</p>
           )}
 
-          {tab === 'public' && datasets.length > 0 && (
+          {datasets.length > 0 && (
             <div className="template-row-list">
               {datasets.map((d) => (
                 <DatasetRow
