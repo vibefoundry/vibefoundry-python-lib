@@ -13,6 +13,7 @@ import './DataLibrary.css'
 const CONNECT_TIMEOUT_MS = 3 * 60 * 1000
 const POLL_MS = 2000
 const STATUS_REFRESH_MS = 15000
+const TICK_MS = 1000
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -55,19 +56,34 @@ const idOf = (entry) => entry.org_id || entry.id
 // apart from the connection it replaced.
 const stampOf = (entry) => (entry ? `${entry.expires || ''}|${entry.connected_at || ''}` : '')
 
+// Resolve expiry to a wall-clock instant once, against the clock reading of the
+// poll that reported it — a countdown rendered from "seconds left" would freeze
+// on whatever the last poll said and be a quarter-minute wrong most of the time.
+// Relative seconds beat the ISO string because they don't care whether this
+// machine's clock agrees with the hub's.
+const expiryAt = (entry, at) => {
+  if (!entry) return null
+  if (typeof entry.seconds_to_expiry === 'number') return at + entry.seconds_to_expiry * 1000
+  if (typeof entry.expires_in === 'number') return at + entry.expires_in * 1000
+  if (entry.expires) {
+    const parsed = Date.parse(entry.expires)
+    if (!Number.isNaN(parsed)) return parsed
+  }
+  return null
+}
+
 // A personal connection lasts an hour, so the difference between "usable" and
 // "about to stop working mid-question" is a number the user has to be able to
 // see without asking for it.
-const expiryLabel = (entry) => {
-  if (!entry) return null
-  let secs = null
-  if (typeof entry.seconds_to_expiry === 'number') secs = entry.seconds_to_expiry
-  else if (typeof entry.expires_in === 'number') secs = entry.expires_in
-  else if (entry.expires) secs = Math.round((Date.parse(entry.expires) - Date.now()) / 1000)
-  if (secs === null || Number.isNaN(secs)) return null
+const expiryLabel = (entry, now) => {
+  const at = entry && entry.expiresAtMs != null ? entry.expiresAtMs : expiryAt(entry, now)
+  if (at == null) return null
+  const secs = Math.round((at - now) / 1000)
   if (secs <= 0) return 'Expired — reconnect'
   if (secs < 60) return `Expires in ${secs}s`
-  const mins = Math.round(secs / 60)
+  // Floor, not round: 90 seconds left is "1 min", never the two minutes the
+  // user would go on to plan a question around.
+  const mins = Math.floor(secs / 60)
   if (mins < 60) return `Expires in ${mins} min`
   return `Expires in ${Math.floor(mins / 60)}h ${mins % 60}m`
 }
@@ -104,21 +120,65 @@ export default function OrgCatalogModal({ open, onClose }) {
   const [error, setError] = useState(null)
   const [connecting, setConnecting] = useState(null)
   const [hubUrl, setHubUrl] = useState('')
+  // org_id -> { startedAt, auto }. A refused credential no longer costs a turn:
+  // the backend clears it and, for the one org it can resolve a hub for, opens
+  // the browser itself. Either way the org drops out of /api/org/status and
+  // would otherwise read as plainly disconnected. `auto` is the difference
+  // between "the browser is already handling it" and "you have to click
+  // Connect" — the backend only reopens the browser for the first of them.
+  const [reauthById, setReauthById] = useState({})
+  const [now, setNow] = useState(() => Date.now())
   // Flipped when the modal closes so an in-flight connect poll stops instead of
   // running for its full three minutes against a modal nobody is looking at.
   const cancelRef = useRef(false)
+  const reauthWasPending = useRef(false)
+  // Name and hub of every org the status endpoint has mentioned, kept so a card
+  // can still be drawn for one whose credential has just been cleared.
+  const lastSeenRef = useRef({})
+
+  const markReauth = useCallback((orgId) => {
+    setReauthById((prev) => (prev[orgId] ? prev : { ...prev, [orgId]: Date.now() }))
+  }, [])
 
   const loadStatus = useCallback(async () => {
     const data = await getJson('/api/org/status')
     const entries = asList(data, 'orgs', 'connected', 'organizations')
+    const fetchedAt = Date.now()
     const byId = {}
     entries.forEach((entry) => {
       const id = idOf(entry)
       // The status endpoint lists connected orgs, so presence is the signal —
       // an explicit connected:false still wins if the backend sends one.
-      if (id) byId[id] = { ...entry, connected: entry.connected !== false }
+      if (!id) return
+      byId[id] = { ...entry, connected: entry.connected !== false, expiresAtMs: expiryAt(entry, fetchedAt) }
+      lastSeenRef.current[id] = { org_name: entry.org_name, hub_url: entry.hub_url }
     })
     setStatusById(byId)
+    setReauthById((prev) => {
+      const next = {}
+      Object.entries(prev).forEach(([id, startedAt]) => {
+        // Back with a credential — the re-auth settled, which is the only thing
+        // the modal was waiting to hear.
+        if (byId[id] && byId[id].connected) return
+        // Nobody finished the sign-in the browser opened. Say "not connected"
+        // rather than keep promising a reconnection that isn't coming.
+        if (fetchedAt - startedAt > CONNECT_TIMEOUT_MS) return
+        next[id] = startedAt
+      })
+      entries.forEach((entry) => {
+        const id = idOf(entry)
+        // A re-auth kicked off by a tool call this modal never made — the
+        // backend says so on the entry itself.
+        if (!id || next[id] || (byId[id] && byId[id].connected)) return
+        if (entry.reauthenticating || entry.status === 'reauth_started') next[id] = fetchedAt
+      })
+      const same =
+        Object.keys(next).length === Object.keys(prev).length &&
+        Object.keys(next).every((id) => prev[id] === next[id])
+      // Returning the same object keeps the poll interval below from being torn
+      // down and rebuilt every fifteen seconds.
+      return same ? prev : next
+    })
     return byId
   }, [])
 
@@ -126,9 +186,12 @@ export default function OrgCatalogModal({ open, onClose }) {
     const data = await getJson('/api/org/catalog')
     // The credential expired under us — the backend has already dropped it, so
     // show nothing rather than a table list the user can no longer read.
-    if (data && data.status === 'reauth_required') {
+    if (data && (data.status === 'reauth_started' || data.status === 'reauth_required')) {
       setTablesByOrg({})
-      setError('That connection has ended. Connect again to keep reading its tables.')
+      // reauth_started means the backend already reopened the browser, so this
+      // is not something the user has to act on — the status poll settles it.
+      if (data.status === 'reauth_started' && data.org_id) markReauth(data.org_id)
+      else setError('That connection has ended. Connect again to keep reading its tables.')
       return
     }
     const rows = asList(data, 'tables', 'datasets', 'catalog')
@@ -142,7 +205,7 @@ export default function OrgCatalogModal({ open, onClose }) {
       ;(byOrg[id] = byOrg[id] || []).push(row)
     })
     setTablesByOrg(byOrg)
-  }, [])
+  }, [markReauth])
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -168,14 +231,35 @@ export default function OrgCatalogModal({ open, onClose }) {
     return () => { cancelRef.current = true }
   }, [open, refresh])
 
+  const reauthPending = Object.keys(reauthById).length > 0
+
   // Keep the countdown and the connected list honest while the modal sits
   // open — a connection can expire, or be made from another window, without
-  // anything happening in this one.
+  // anything happening in this one. The same poll, faster, is what a re-auth
+  // waits on: a browser round-trip against a live Google session is over in a
+  // couple of seconds and shouldn't sit under "reconnecting" for fifteen.
   useEffect(() => {
     if (!open) return
-    const timer = setInterval(() => { loadStatus().catch(() => {}) }, STATUS_REFRESH_MS)
+    const timer = setInterval(() => { loadStatus().catch(() => {}) }, reauthPending ? POLL_MS : STATUS_REFRESH_MS)
     return () => clearInterval(timer)
-  }, [open, loadStatus])
+  }, [open, loadStatus, reauthPending])
+
+  // The countdown has to move between polls, so drive it off the clock rather
+  // than off whatever the last /api/org/status happened to return.
+  useEffect(() => {
+    if (!open) return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), TICK_MS)
+    return () => clearInterval(timer)
+  }, [open])
+
+  // The table list on screen was read with a credential that has since been
+  // thrown away, so re-read it once the replacement lands.
+  useEffect(() => {
+    if (!open) return
+    if (reauthWasPending.current && !reauthPending) loadCatalog().catch(() => {})
+    reauthWasPending.current = reauthPending
+  }, [open, reauthPending, loadCatalog])
 
   const connect = async (payload, busyKey) => {
     setConnecting(busyKey)
@@ -242,7 +326,19 @@ export default function OrgCatalogModal({ open, onClose }) {
   const listed = new Set(orgs.map(idOf))
   Object.values(statusById).forEach((entry) => {
     const id = idOf(entry)
-    if (id && !listed.has(id)) rows.push({ id, name: entry.org_name, hub_url: entry.hub_url })
+    if (id && !listed.has(id)) {
+      rows.push({ id, name: entry.org_name, hub_url: entry.hub_url })
+      listed.add(id)
+    }
+  })
+  // Re-authenticating means the credential is gone, which for a pasted-hub org
+  // means the status endpoint no longer mentions it at all — its card would
+  // blink out of the modal at exactly the moment it has something to say.
+  Object.keys(reauthById).forEach((id) => {
+    if (listed.has(id)) return
+    const seen = lastSeenRef.current[id] || {}
+    rows.push({ id, name: seen.org_name, hub_url: seen.hub_url })
+    listed.add(id)
   })
 
   return (
@@ -275,7 +371,8 @@ export default function OrgCatalogModal({ open, onClose }) {
             const status = statusById[id]
             const connected = status ? status.connected : !!org.connected
             const busy = connecting === id
-            const expires = expiryLabel(status || org)
+            const reauthing = !connected && !!reauthById[id]
+            const expires = expiryLabel(status || org, now)
             return (
               <section key={id} className="pubdata-container orgcat-card">
                 <div className="orgcat-head">
@@ -303,13 +400,15 @@ export default function OrgCatalogModal({ open, onClose }) {
                   </div>
                 </div>
 
-                <div className={`orgcat-status ${connected ? 'is-on' : ''}`}>
+                <div className={`orgcat-status ${connected ? 'is-on' : reauthing ? 'is-reauth' : ''}`}>
                   <span className="orgcat-dot" />
                   {connected ? (
                     <span>
                       Connected{status?.email ? ` as ${status.email}` : ''}
                       {expires ? ` · ${expires}` : ''}
                     </span>
+                  ) : reauthing ? (
+                    <span>The hour ran out — signing you in again in your browser…</span>
                   ) : (
                     <span>Not connected</span>
                   )}

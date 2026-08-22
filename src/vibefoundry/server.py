@@ -849,6 +849,70 @@ def _ensure_gitignored(project_folder: Path, entry: str) -> None:
         print(f"[Build] could not add {entry} to .gitignore: {e}")
 
 
+async def _fetch_remote_agents_md() -> Optional[bytes]:
+    """The cascaded IDE-Agents/AGENTS.md — the authenticated proxy when signed
+    in, else the public website path. One fetcher shared by /api/build,
+    /api/track0/scaffold and /api/rules so the fallback chain cannot drift
+    between them. (The website-download variant lives in Templates-Agents/ and
+    is only bundled into downloadable zips.)"""
+    stored = _read_stored_token()
+    jwt = stored["token"] if stored else ""
+    if jwt:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.get(
+                    f"{PROXY_BASE_URL}/IDE-Agents/AGENTS.md",
+                    headers={
+                        "Authorization": f"Bearer {jwt}",
+                        "Accept": "application/vnd.github.raw",
+                    },
+                )
+                if res.status_code == 200:
+                    return res.content
+        except Exception as e:
+            print(f"[Build] Authenticated AGENTS.md fetch failed ({e}); falling back to public path")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.get(f"{PUBLIC_TEMPLATE_FALLBACK_URL}/IDE-Agents/AGENTS.md")
+            if res.status_code == 200:
+                return res.content
+    except Exception as e:
+        print(f"[Build] Public AGENTS.md fallback also failed: {e}")
+    return None
+
+
+async def _ensure_agents_md(project_folder: Path, overwrite: bool) -> str:
+    """AGENTS.md plus the CLAUDE.md shim in `project_folder`.
+
+    Build refreshes AGENTS.md on every run (overwrite=True) so a rules change
+    ships without a package release; scaffold only fills a gap, so a user who
+    edited their rulebook keeps it. CLAUDE.md is never overwritten either way —
+    Claude Code auto-loads it, not AGENTS.md (the Codex convention), and the
+    one-line import makes both assistants read the same rules.
+
+    Returns "written" | "present" | "unavailable"."""
+    agents_dest = project_folder / "AGENTS.md"
+    result = "present" if agents_dest.exists() else "unavailable"
+    if overwrite or not agents_dest.exists():
+        body = await _fetch_remote_agents_md()
+        if body is not None:
+            agents_dest.write_bytes(body)
+            result = "written"
+            # A rewritten rulebook invalidates the cached Track 0 section, or
+            # /api/rules keeps serving the copy this build just replaced.
+            _rules_cache.pop(str(project_folder), None)
+
+    claude_dest = project_folder / "CLAUDE.md"
+    # Only shim to a rulebook that is actually on disk. Writing `@AGENTS.md`
+    # after a failed fetch leaves a dangling import on a fresh offline project,
+    # and because CLAUDE.md is never overwritten the broken shim would survive
+    # the first build that succeeds.
+    if agents_dest.exists() and not claude_dest.exists():
+        claude_dest.write_text("@AGENTS.md\n", encoding="utf-8")
+    return result
+
+
 @app.post("/api/build")
 async def build_project():
     """Build the project structure — creates the input/output/app folders,
@@ -861,48 +925,11 @@ async def build_project():
 
     # Create folder structure (input_folder/, output_folder/, app_folder/, etc.)
     folders = setup_project_structure(state.project_folder)
-    agents_md_written = False
 
-    # Fetch AGENTS.md — try the authenticated proxy first, then fall back to
-    # the public website path for unauthenticated users. The IDE-cascaded copy
-    # lives at IDE-Agents/AGENTS.md (the website-download variant lives in
-    # Templates-Agents/ and is only bundled into downloadable zips).
+    # jwt is still read here because env.template below needs it too.
     stored = _read_stored_token()
     jwt = stored["token"] if stored else ""
-    agents_dest = state.project_folder / "AGENTS.md"
-
-    if jwt:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                res = await client.get(
-                    f"{PROXY_BASE_URL}/IDE-Agents/AGENTS.md",
-                    headers={
-                        "Authorization": f"Bearer {jwt}",
-                        "Accept": "application/vnd.github.raw",
-                    },
-                )
-                if res.status_code == 200:
-                    agents_dest.write_bytes(res.content)
-                    agents_md_written = True
-        except Exception as e:
-            print(f"[Build] Authenticated AGENTS.md fetch failed ({e}); falling back to public path")
-
-    if not agents_md_written:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.get(f"{PUBLIC_TEMPLATE_FALLBACK_URL}/IDE-Agents/AGENTS.md")
-                if res.status_code == 200:
-                    agents_dest.write_bytes(res.content)
-                    agents_md_written = True
-        except Exception as e:
-            print(f"[Build] Public AGENTS.md fallback also failed: {e}")
-
-    # Claude Code auto-loads CLAUDE.md, not AGENTS.md (the Codex convention).
-    # A one-line import shim makes both assistants read the same rules. Never
-    # overwrite an existing CLAUDE.md — the user may have customized it.
-    claude_dest = state.project_folder / "CLAUDE.md"
-    if not claude_dest.exists():
-        claude_dest.write_text("@AGENTS.md\n", encoding="utf-8")
+    await _ensure_agents_md(state.project_folder, overwrite=True)
 
     # Drop a `.env` at the project root — the one place data-access secrets
     # live. Never overwrite an existing one: it holds the user's pasted keys.
@@ -991,6 +1018,110 @@ async def build_project():
         "env_created": env_created,
         "git_initialized": git_initialized
     }
+
+
+# --- Track 0 rules -----------------------------------------------------------
+#
+# The Track 0 section of AGENTS.md, served on its own to a model that has
+# never seen the rest of the file. That is why the section is written to be
+# liftable verbatim, and why this endpoint can never fail: offline is not an
+# excuse for the model not knowing where to put files.
+
+BUILTIN_TRACK0_RULES = """\
+# Track 0: Queries
+
+A question about the data is answered by BUILDING: a small script per
+question, run, and the answer read back out of the files it produced. Never
+answer from memory, and never answer from rows seen mid-pipeline.
+
+Folder, under the open project (`app_folder/` is created if absent):
+
+    app_folder/scripts/{script_name}/
+    |- app.py           orchestrator, runs the steps in order
+    |- raw_pulls/       data pulled from the gateway or a public dataset
+    |- steps/           step1_*.py, step2_*.py ... the processing logic
+    `- final_output/    the answer: parquet / csv / xlsx / png / gif
+
+`{script_name}` comes from the question (`georgia_top_accounts`). A follow-up
+on the same subject reuses that folder and modifies its scripts.
+
+Rules, all deliberate departures from Tracks 1-4:
+
+- No `run_app.sh`, no `run_app.bat`, no `.command`, no `requirements.txt`.
+  Nothing launches this standalone.
+- No comments in any `.py`. None. No docstrings either. The chat answer is
+  the explanation; these scripts are the working, not the document.
+- Numbered steps live inside `steps/`. `app.py` is the only file at the root.
+- Pulled data lands in `raw_pulls/`, not `input_folder/`.
+- The answer lands in `final_output/`, not `output_folder/`. A merged table
+  always; images too when the question asked for them.
+
+Then run the script, read `final_output/`, and answer from that — a preview
+inline, or the whole table when it is small enough to be worth showing. The
+file and the answer cannot disagree, because they are the same thing.
+"""
+
+# Resolved rules keyed by project folder. The contract asks for a
+# life-of-the-process cache; keying it means switching projects switches
+# rulebooks, instead of serving project A's customised AGENTS.md to project B.
+_rules_cache: dict[str, dict] = {}
+
+
+def _extract_track0_section(markdown: str) -> Optional[str]:
+    """From the line matching `^# Track 0` up to (not including) the next line
+    matching `^# Track `, or EOF. Returns None when there is no Track 0
+    section — an older AGENTS.md has to fall through to the next source rather
+    than serve nothing."""
+    lines = (markdown or "").splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith("# Track 0")), None)
+    if start is None:
+        return None
+    end = next(
+        (j for j in range(start + 1, len(lines)) if lines[j].startswith("# Track ")),
+        len(lines),
+    )
+    section = "\n".join(lines[start:end]).strip()
+    return section or None
+
+
+@app.get("/api/rules")
+async def get_rules():
+    """The Track 0 rules as markdown, resolved project → remote → built-in.
+
+    The project's own AGENTS.md wins: a user who customised their rulebook
+    gets their rules, not ours."""
+    key = str(state.project_folder or "")
+    cached = _rules_cache.get(key)
+    if cached:
+        return cached
+
+    section = None
+    source = "builtin"
+
+    if state.project_folder:
+        local = state.project_folder / "AGENTS.md"
+        try:
+            if local.exists():
+                section = _extract_track0_section(local.read_text(encoding="utf-8", errors="replace"))
+                if section:
+                    source = "project"
+        except OSError as e:
+            print(f"[Rules] could not read the project's AGENTS.md: {e}")
+
+    if not section:
+        body = await _fetch_remote_agents_md()
+        if body:
+            section = _extract_track0_section(body.decode("utf-8", errors="replace"))
+            if section:
+                source = "remote"
+
+    if not section:
+        section = BUILTIN_TRACK0_RULES.strip()
+        source = "builtin"
+
+    resolved = {"source": source, "markdown": section, "bytes": len(section.encode("utf-8"))}
+    _rules_cache[key] = resolved
+    return resolved
 
 
 # --- Template selective download / delete -----------------------------------
@@ -1192,7 +1323,7 @@ def _safe_dest(folder: Path, filename: str) -> Path:
     try:
         dest.relative_to(folder.resolve())
     except ValueError:
-        raise HTTPException(status_code=502, detail="Upstream filename escapes input_folder")
+        raise HTTPException(status_code=502, detail="Upstream filename escapes the destination folder")
     return dest
 
 
@@ -1351,6 +1482,92 @@ async def download_public_data(req: DataDownloadRequest):
     }
 
 
+# --- Track 0 scaffold --------------------------------------------------------
+#
+# Track 0 answers by building, into a folder shape that is deliberately not
+# Tracks 1-4's: pulls land in raw_pulls/ instead of input_folder/, the answer
+# in final_output/ instead of output_folder/, and nothing launches standalone.
+# /api/rules serves the rules themselves.
+
+TRACK0_SUBFOLDERS = ("raw_pulls", "steps", "final_output")
+
+
+def _valid_script_name(name: str) -> bool:
+    """The model picks this name out of the question, so it is untrusted input
+    that becomes a folder name: allow-listed, not sanitized."""
+    if not name or len(name) > 96:
+        return False
+    return all(c.isalnum() or c in ("_", "-") for c in name)
+
+
+def _is_track0_folder(folder: Path) -> bool:
+    """Whether an existing folder is one Track 0 may take over: one it already
+    owns (it has at least one of the three subfolders) or an empty one.
+    Anything else is a Track 1-4 task folder that happens to share the name,
+    and that is someone's app — see _script_folders."""
+    if not folder.is_dir():
+        return False
+    if any((folder / sub).is_dir() for sub in TRACK0_SUBFOLDERS):
+        return True
+    return not any(folder.iterdir())
+
+
+def _script_folders(script_name: str) -> dict:
+    """The Track 0 folder for `script_name` plus its three subfolders, created
+    if missing. `reused` reports whether the folder was already there — a
+    follow-up on the same subject is meant to land back in the same one.
+
+    The model picks this name out of free text, so it can collide with an
+    existing Track 1-4 task folder. Reuse is only silent for a folder Track 0
+    already owns; injecting raw_pulls/, steps/ and final_output/ into someone's
+    app is a conflict the caller has to resolve by picking another name."""
+    if not state.project_folder:
+        raise HTTPException(status_code=400, detail="No project folder selected")
+    if not _valid_script_name(script_name):
+        raise HTTPException(status_code=400, detail="script_name must be letters, digits, _ or -")
+
+    folder = state.project_folder / "app_folder" / "scripts" / script_name
+    reused = folder.exists()
+    if reused and not _is_track0_folder(folder):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"app_folder/scripts/{script_name} already exists and is not a Track 0 "
+                "folder. Pick a different script_name."
+            ),
+        )
+    paths = {"folder": folder, "reused": reused}
+    for sub in TRACK0_SUBFOLDERS:
+        # parents=True also creates app_folder/ and app_folder/scripts/ for a
+        # project that has never been built.
+        path = folder / sub
+        path.mkdir(parents=True, exist_ok=True)
+        paths[sub] = path
+    return paths
+
+
+class Track0ScaffoldRequest(BaseModel):
+    script_name: str
+
+
+@app.post("/api/track0/scaffold")
+async def track0_scaffold(req: Track0ScaffoldRequest):
+    """Create (or silently reuse) the Track 0 folder for one question, and make
+    sure the project has the rulebook the model is about to write against."""
+    paths = _script_folders(req.script_name)
+    agents_md = await _ensure_agents_md(state.project_folder, overwrite=False)
+    await _after_download()
+    return {
+        "script_name": req.script_name,
+        "folder": str(paths["folder"]),
+        "raw_pulls": str(paths["raw_pulls"]),
+        "steps": str(paths["steps"]),
+        "final_output": str(paths["final_output"]),
+        "reused": paths["reused"],
+        "agents_md": agents_md,
+    }
+
+
 # --- Organizations: connect, catalogue, query --------------------------------
 #
 # The IDE talks straight to the client's own hub and gateway. Nothing in this
@@ -1365,12 +1582,24 @@ async def download_public_data(req: DataDownloadRequest):
 _ORG_STATE_TTL_SECONDS = 600  # 10 minutes, same as the sign-in nonce
 _pending_org_states: dict[str, dict] = {}  # nonce -> {"hub_url": str, "expires": ts}
 
+# One in-flight connect per org. A pane catalogue refresh and a plugin tool
+# call hitting the same expired credential are two callers with one intent:
+# without this they open two browser tabs and mint two nonces, and the user
+# signs in twice. org_id (or the hub URL for a pasted hub) -> the handshake
+# already running for it.
+_org_connect_inflight: dict[str, dict] = {}  # key -> {"nonce", "expires", "result"}
+
 _ORG_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
 
 # Rows returned inline by /api/org/query. Anything past this spills to a
-# parquet in output_folder/queries/ — an LLM caller cannot read 200k rows, and
-# a pane cannot render them, but a script downstream can read the file.
+# parquet in the script's final_output/ — an LLM caller cannot read 200k rows,
+# and a pane cannot render them, but a step downstream can read the file.
 QUERY_PREVIEW_ROWS = 500
+
+# Where a spill lands when the caller named no script. Track 0's answer always
+# lives in a final_output/, so the fallback is a real Track 0 folder rather
+# than a stray file somewhere else.
+QUERY_FALLBACK_SCRIPT = "queries"
 
 
 class OrgReauthRequired(Exception):
@@ -1378,12 +1607,31 @@ class OrgReauthRequired(Exception):
     gateway call so every endpoint can answer with the reconnect handshake
     instead of an error the UI would have to special-case."""
 
+    def __init__(self, org_id: str, hub_url: Optional[str] = None):
+        super().__init__(org_id)
+        self.org_id = org_id
+        # Captured before the credential is dropped: an org reached by a pasted
+        # hub URL is not in the bundled list, so once its entry is gone there
+        # would be no hub left to send the user back to.
+        self.hub_url = hub_url
+
+
+class OrgNotConnected(Exception):
+    """This org has no stored credential at all — never connected on this
+    machine, or disconnected. Distinct from OrgReauthRequired on purpose:
+    auto-reauth is scoped to a gateway 401/403 on a credential that exists, so
+    this case is reported rather than self-healed. Opening a hub sign-in tab
+    for an org the user never connected is a surprise, and the caller's remedy
+    is one connect_organization call."""
+
     def __init__(self, org_id: str):
         super().__init__(org_id)
         self.org_id = org_id
 
 
-def _reauth_response(org_id: str) -> dict:
+def _not_connected_response(org_id: str) -> dict:
+    """The instant "call connect_organization" answer. Same wire shape the
+    plugin already handles for a lapsed credential, minus the browser."""
     return {"status": "reauth_required", "org_id": org_id}
 
 
@@ -1495,6 +1743,15 @@ def _purge_expired_org_states() -> None:
     now = time.time()
     for nonce in [n for n, v in _pending_org_states.items() if v.get("expires", 0) < now]:
         _pending_org_states.pop(nonce, None)
+    for key in [k for k, v in _org_connect_inflight.items() if v.get("expires", 0) < now]:
+        _org_connect_inflight.pop(key, None)
+
+
+def _clear_org_connect_inflight(nonce: str) -> None:
+    """Drop the in-flight record whose nonce just came back through the
+    callback: that handshake is over, so the next expiry may open a tab again."""
+    for key in [k for k, v in _org_connect_inflight.items() if v.get("nonce") == nonce]:
+        _org_connect_inflight.pop(key, None)
 
 
 def _valid_table_id(tid: str) -> bool:
@@ -1522,7 +1779,7 @@ async def _gateway_request(entry: dict, method: str, path: str, json_body: Optio
 
     if res.status_code in (401, 403):
         _drop_org(entry.get("org_id"))
-        raise OrgReauthRequired(entry.get("org_id"))
+        raise OrgReauthRequired(entry.get("org_id"), entry.get("hub_url"))
     return res
 
 
@@ -1549,8 +1806,91 @@ def _gateway_json(res: httpx.Response) -> dict:
 def _require_org(org_id: str) -> dict:
     entry = _org_entry(org_id)
     if not entry:
-        raise OrgReauthRequired(org_id)
+        # No stored credential is not a refused one: nothing to re-authenticate,
+        # so say so instead of opening a browser the caller did not ask for.
+        raise OrgNotConnected(org_id)
     return entry
+
+
+def _callback_host(request: Optional[Request]) -> str:
+    """The Host header, not a hardcoded port: the backend binds whatever port
+    was free, and the hub only accepts a loopback callback."""
+    if request is None:
+        return "127.0.0.1:8765"
+    return request.headers.get("host", "127.0.0.1:8765")
+
+
+async def _start_org_connect(
+    hub_url: str,
+    host: str,
+    key: Optional[str] = None,
+    dedupe: bool = False,
+) -> dict:
+    """Mint a nonce and open the hub's /connect in the user's browser.
+
+    Unlike /api/auth/start, which hands the URL back for the frontend to open,
+    this process opens the browser itself: connect is driven from a plugin tool
+    call as often as from the UI, and a sandboxed pane cannot open a top-level
+    window. The URL is still returned so the UI can offer it as a link when
+    webbrowser has nothing to launch.
+
+    `dedupe` is for the automatic path. A pane catalogue refresh and a plugin
+    tool call hitting the same expired credential are two callers with one
+    intent: without the guard they open two tabs and mint two nonces, and the
+    user signs in twice. An explicit /api/org/connect is a deliberate click, so
+    it always opens a tab — but it takes over the slot, so an auto-reauth
+    arriving behind it rides on the handshake already in the browser."""
+    _purge_expired_org_states()
+    slot = key or hub_url
+    if dedupe:
+        running = _org_connect_inflight.get(slot)
+        if running:
+            return dict(running["result"])
+
+    nonce = secrets.token_urlsafe(32)
+    _pending_org_states[nonce] = {"hub_url": hub_url, "expires": time.time() + _ORG_STATE_TTL_SECONDS}
+
+    callback_url = f"http://{host}/org/callback"
+    connect_url = (
+        f"{hub_url}/connect"
+        f"?state={nonce}"
+        f"&callback={urllib.parse.quote(callback_url, safe='')}"
+    )
+    opened = await asyncio.to_thread(webbrowser.open, connect_url)
+    result = {"hub_url": hub_url, "url": connect_url, "browser_opened": bool(opened)}
+    _org_connect_inflight[slot] = {
+        "nonce": nonce,
+        "expires": time.time() + _ORG_STATE_TTL_SECONDS,
+        "result": result,
+    }
+    state.open_org_catalog = True
+    return dict(result)
+
+
+def _hub_for_org(org_id: str, hub_url: Optional[str]) -> Optional[str]:
+    """Where to send the user back to. The exception's copy first, because the
+    stored entry may already have been dropped by the 403 that got us here."""
+    if hub_url:
+        return hub_url
+    entry = _org_entry(org_id)
+    if entry and entry.get("hub_url"):
+        return entry["hub_url"]
+    org = find_organization(org_id)
+    return org["hub_url"] if org else None
+
+
+async def _reauth_response(org_id: str, hub_url: Optional[str] = None, host: str = "127.0.0.1:8765") -> dict:
+    """Re-authenticate instead of reporting. Merely returning "reconnect" costs
+    a model turn, and with a one-hour credential that is an hourly stumble — so
+    the credential is cleared and the browser opened here, and the caller polls
+    /api/org/status and retries its call once."""
+    hub = _hub_for_org(org_id, hub_url)
+    _drop_org(org_id)
+    if not hub:
+        # A pasted hub whose entry is already gone: nothing to reopen.
+        return {"status": "reauth_required", "org_id": org_id}
+    started = await _start_org_connect(hub, host, key=org_id or hub, dedupe=True)
+    return {"status": "reauth_started", "org_id": org_id, **started}
 
 
 # --- SQL guard rails ---------------------------------------------------------
@@ -1617,14 +1957,6 @@ def _frame_to_rows(df: pl.DataFrame) -> tuple[list[str], list[list]]:
     return columns, [[_json_scalar(rec.get(c)) for c in columns] for rec in records]
 
 
-def _queries_folder() -> Optional[Path]:
-    if not state.project_folder:
-        return None
-    folder = state.project_folder / "output_folder" / "queries"
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder
-
-
 def _query_result_stem(tables_used: list) -> str:
     base = ""
     if tables_used:
@@ -1632,13 +1964,16 @@ def _query_result_stem(tables_used: list) -> str:
     return f"{base or 'query'}_{time.strftime('%Y%m%d_%H%M%S')}"
 
 
-def _spill_result(df: pl.DataFrame, tables_used: list) -> Optional[str]:
-    """Write a too-big result to output_folder/queries/ and return its path.
-    Returns None when there is no project folder — the preview still answers
-    the question, and losing the spill is better than failing the query."""
-    folder = _queries_folder()
-    if folder is None:
+def _spill_result(df: pl.DataFrame, tables_used: list, script_name: Optional[str] = None) -> Optional[str]:
+    """Write a too-big result into the script's final_output/ and return its
+    path. Returns None when there is no project folder — the preview still
+    answers the question, and losing the spill is better than failing the query."""
+    if not state.project_folder:
         return None
+    # No fallback here: /api/org/query resolves a caller-supplied script_name
+    # before it runs any SQL, so by this point the name is known good. Callers
+    # treat a raised failure as "lost the spill, keep the answer".
+    folder = _script_folders(script_name or QUERY_FALLBACK_SCRIPT)["final_output"]
     dest = folder / f"{_query_result_stem(tables_used)}.parquet"
     df.write_parquet(dest)
     return str(dest)
@@ -1714,10 +2049,17 @@ async def _collect_public_sql(sql: str, limit: Optional[int]) -> tuple:
     return df, wanted, int((time.time() - started) * 1000)
 
 
-async def _run_public_sql(sql: str, limit: Optional[int]) -> dict:
+async def _run_public_sql(sql: str, limit: Optional[int], script_name: Optional[str] = None) -> dict:
     df, wanted, elapsed_ms = await _collect_public_sql(sql, limit)
     columns, rows = _frame_to_rows(df.head(QUERY_PREVIEW_ROWS))
-    spilled = _spill_result(df, wanted) if df.height > QUERY_PREVIEW_ROWS else None
+    spilled = None
+    if df.height > QUERY_PREVIEW_ROWS:
+        # Guarded exactly as the org path is: the answer is already computed,
+        # and a failed write into final_output/ must not turn it into a 500.
+        try:
+            spilled = _spill_result(df, wanted, script_name)
+        except Exception as e:
+            print(f"[Public] could not spill query result: {e}")
     return {
         "status": "ok",
         "org_id": PUBLIC_ORG_ID,
@@ -1732,7 +2074,7 @@ async def _run_public_sql(sql: str, limit: Optional[int]) -> dict:
     }
 
 
-async def _run_org_sql(entry: dict, sql: str, limit: Optional[int]) -> dict:
+async def _run_org_sql(entry: dict, sql: str, limit: Optional[int], script_name: Optional[str] = None) -> dict:
     body = {"sql": sql, "format": "json"}
     if limit and limit > 0:
         body["limit"] = int(limit)
@@ -1748,7 +2090,11 @@ async def _run_org_sql(entry: dict, sql: str, limit: Optional[int]) -> dict:
     spilled = None
     if len(rows) > QUERY_PREVIEW_ROWS:
         try:
-            spilled = _spill_result(pl.DataFrame(rows, schema=columns, orient="row"), payload.get("tables_used") or [])
+            spilled = _spill_result(
+                pl.DataFrame(rows, schema=columns, orient="row"),
+                payload.get("tables_used") or [],
+                script_name,
+            )
         except Exception as e:
             print(f"[Org] could not spill query result: {e}")
         rows = rows[:QUERY_PREVIEW_ROWS]
@@ -1783,6 +2129,7 @@ class OrgQueryRequest(BaseModel):
     org_id: str
     sql: str
     limit: Optional[int] = None
+    script_name: Optional[str] = None
 
 
 class OrgPullRequest(BaseModel):
@@ -1790,6 +2137,7 @@ class OrgPullRequest(BaseModel):
     table_id: str = ""
     sql: Optional[str] = None
     filename: Optional[str] = None
+    script_name: Optional[str] = None
 
 
 @app.get("/api/org/list")
@@ -1846,34 +2194,8 @@ async def org_connect(req: OrgConnectRequest, request: Request):
     else:
         raise HTTPException(status_code=400, detail="Supply an org_id or a hub_url")
 
-    nonce = secrets.token_urlsafe(32)
-    _pending_org_states[nonce] = {"hub_url": hub_url, "expires": time.time() + _ORG_STATE_TTL_SECONDS}
-
-    # The Host header, not a hardcoded port: the backend binds whatever port
-    # was free, and the hub only accepts a loopback callback.
-    host = request.headers.get("host", "127.0.0.1:8765")
-    callback_url = f"http://{host}/org/callback"
-    connect_url = (
-        f"{hub_url}/connect"
-        f"?state={nonce}"
-        f"&callback={urllib.parse.quote(callback_url, safe='')}"
-    )
-
-    # Unlike /api/auth/start, which hands the URL back for the frontend to
-    # open, this process opens the browser itself: connect is driven from a
-    # plugin tool call as often as from the UI, and a sandboxed pane cannot
-    # open a top-level window. The URL is still returned so the UI can offer
-    # it as a link when webbrowser has nothing to launch.
-    opened = await asyncio.to_thread(webbrowser.open, connect_url)
-    state.open_org_catalog = True
-
-    return {
-        "status": "opened",
-        "org_id": org_hint,
-        "hub_url": hub_url,
-        "url": connect_url,
-        "browser_opened": bool(opened),
-    }
+    started = await _start_org_connect(hub_url, _callback_host(request), key=org_hint or hub_url)
+    return {"status": "opened", "org_id": org_hint, **started}
 
 
 @app.get("/org/callback")
@@ -1908,6 +2230,10 @@ async def org_callback(
             _auth_callback_html(error="Invalid or expired connection attempt. Try again from the IDE.", **page),
             status_code=400,
         )
+    # The nonce came back, so this handshake is over whatever the hub sent with
+    # it. Release the slot now or the next expiry inside the 10-minute window
+    # would silently reuse a tab the user has already finished with.
+    _clear_org_connect_inflight(state_nonce)
     if not (app_id and app_key and gateway and org_id):
         return HTMLResponse(
             _auth_callback_html(error="The hub's response was missing credential fields.", **page),
@@ -1955,7 +2281,7 @@ async def org_disconnect(req: OrgDisconnectRequest):
 
 
 @app.get("/api/org/catalog")
-async def org_catalog():
+async def org_catalog(request: Request):
     """Every connected org's tables plus the public library, in one shape.
 
     One org being unreachable must not blank the catalogue — its failure is
@@ -1964,14 +2290,16 @@ async def org_catalog():
     tables: list[dict] = []
     errors: list[dict] = []
     reauth: list[str] = []
+    reauth_hub: Optional[str] = None
 
     for entry in _read_orgs().values():
         org_id = entry.get("org_id")
         try:
             res = await _gateway_request(entry, "GET", "/v1/tables")
             payload = _gateway_json(res)
-        except OrgReauthRequired:
+        except OrgReauthRequired as e:
             reauth.append(org_id)
+            reauth_hub = reauth_hub or e.hub_url
             continue
         except HTTPException as e:
             errors.append({"org_id": org_id, "error": str(e.detail)})
@@ -2020,11 +2348,20 @@ async def org_catalog():
             "columns": columns,
         })
 
-    return {"tables": tables, "errors": errors, "reauth_required": reauth}
+    # `reauth_org_ids`, not `reauth_required`: the update below can set
+    # top-level `status` to the string "reauth_required", and one key must not
+    # mean both "the signal" and "the list of orgs it applies to".
+    result = {"tables": tables, "errors": errors, "reauth_org_ids": reauth, "status": "ok"}
+    if reauth:
+        # The tables that did load are still returned alongside: the caller
+        # retries the whole catalogue once the browser round trip lands, and a
+        # frontend that only reads `tables` keeps working meanwhile.
+        result.update(await _reauth_response(reauth[0], reauth_hub, _callback_host(request)))
+    return result
 
 
 @app.get("/api/org/schema/{org_id}/{table_id}")
-async def org_schema(org_id: str, table_id: str):
+async def org_schema(org_id: str, table_id: str, request: Request):
     """One table's column profile — what a caller reads before writing SQL."""
     if not _valid_table_id(table_id):
         raise HTTPException(status_code=400, detail="Invalid table_id")
@@ -2047,30 +2384,43 @@ async def org_schema(org_id: str, table_id: str):
         entry = _require_org(org_id)
         res = await _gateway_request(entry, "GET", f"/v1/tables/{table_id}/schema")
         payload = _gateway_json(res)
+    except OrgNotConnected as e:
+        return _not_connected_response(e.org_id)
     except OrgReauthRequired as e:
-        return _reauth_response(e.org_id)
+        return await _reauth_response(e.org_id, e.hub_url, _callback_host(request))
     return {"source": "org", "org_id": org_id, **payload}
 
 
 @app.post("/api/org/query")
-async def org_query(req: OrgQueryRequest):
+async def org_query(req: OrgQueryRequest, request: Request):
     """Answer a question with SQL, at the gateway for an org and locally for
     public data. This is the path that means a question costs a few hundred
-    rows rather than a whole-table download."""
+    rows rather than a whole-table download.
+
+    A named `script_name` is resolved before any SQL runs - same policy as
+    /api/org/pull: an unusable name is the caller's 400 at the door, never a
+    result quietly redirected somewhere else after the work is done."""
+    if req.script_name:
+        _script_folders(req.script_name)
     if req.org_id == PUBLIC_ORG_ID:
-        return await _run_public_sql(req.sql, req.limit)
+        return await _run_public_sql(req.sql, req.limit, req.script_name)
     try:
         entry = _require_org(req.org_id)
-        return await _run_org_sql(entry, req.sql, req.limit)
+        return await _run_org_sql(entry, req.sql, req.limit, req.script_name)
+    except OrgNotConnected as e:
+        return _not_connected_response(e.org_id)
     except OrgReauthRequired as e:
-        return _reauth_response(e.org_id)
+        return await _reauth_response(e.org_id, e.hub_url, _callback_host(request))
 
 
 @app.post("/api/org/pull")
-async def org_pull(req: OrgPullRequest):
-    """Land data in input_folder/ for a script to read — a query result when
-    `sql` is given, the whole table when it isn't."""
-    folder = _input_folder()
+async def org_pull(req: OrgPullRequest, request: Request):
+    """Land data on disk for a script to read — a query result when `sql` is
+    given, the whole table when it isn't.
+
+    With `script_name` the cut lands in that Track 0 script's raw_pulls/;
+    without it, in input_folder/ for Tracks 1-4, exactly as before."""
+    folder = _script_folders(req.script_name)["raw_pulls"] if req.script_name else _input_folder()
 
     if req.org_id == PUBLIC_ORG_ID:
         if req.sql:
@@ -2084,12 +2434,21 @@ async def org_pull(req: OrgPullRequest):
             # not for whatever copy is already sitting in input_folder.
             source, _ = await _ensure_public_parquet(req.table_id, force=True)
             dest = source
-            if req.filename:
-                dest = _safe_dest(folder, req.filename)
+            # _ensure_public_parquet only ever writes to input_folder/, so a
+            # Track 0 pull has to be copied on from there.
+            if req.filename or folder.resolve() != source.parent.resolve():
+                dest = _safe_dest(folder, req.filename or source.name)
                 if dest != source:
                     shutil.copyfile(source, dest)
         await _after_download()
-        return {"success": True, "org_id": PUBLIC_ORG_ID, "filename": dest.name, "bytes": dest.stat().st_size}
+        return {
+            "success": True,
+            "org_id": PUBLIC_ORG_ID,
+            "filename": dest.name,
+            "bytes": dest.stat().st_size,
+            "path": str(dest),
+            "script_name": req.script_name,
+        }
 
     if not req.sql and not _valid_table_id(req.table_id):
         raise HTTPException(status_code=400, detail="Invalid table_id")
@@ -2103,8 +2462,10 @@ async def org_pull(req: OrgPullRequest):
         else:
             res = await _gateway_request(entry, "GET", f"/v1/tables/{req.table_id}")
             default_name = f"{req.table_id}.parquet"
+    except OrgNotConnected as e:
+        return _not_connected_response(e.org_id)
     except OrgReauthRequired as e:
-        return _reauth_response(e.org_id)
+        return await _reauth_response(e.org_id, e.hub_url, _callback_host(request))
 
     _raise_for_gateway_error(res)
 
@@ -2117,6 +2478,8 @@ async def org_pull(req: OrgPullRequest):
         "table_id": req.table_id,
         "filename": dest.name,
         "bytes": dest.stat().st_size,
+        "path": str(dest),
+        "script_name": req.script_name,
     }
 
 

@@ -651,6 +651,16 @@
 
 .orgcat-status.is-on .orgcat-dot { background: #16a34a; }
 
+/* Amber, not red: the hour ran out but nothing is broken and nobody has to do
+   anything — the browser is already handling it. Reuses the tree's pulse-dot
+   so "working on it" looks the same everywhere in the IDE. */
+.orgcat-status.is-reauth { color: #b45309; }
+
+.orgcat-status.is-reauth .orgcat-dot {
+  background: #f59e0b;
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
 /* Capped rather than fixed: three granted tables shouldn't leave a dead pane,
    forty shouldn't push the next org off the modal. */
 .orgcat-tables {
