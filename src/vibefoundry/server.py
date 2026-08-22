@@ -1051,7 +1051,7 @@ Rules, all deliberate departures from Tracks 1-4:
   Nothing launches this standalone.
 - No comments in any `.py`. None. No docstrings either. The chat answer is
   the explanation; these scripts are the working, not the document.
-- Numbered steps live inside `steps/`. `app.py` is the only file at the root.
+- Numbered steps live inside `steps/`, and the first is always `step1_pull.py`, which imports `vf.py` from the folder root and holds the SQL. `app.py` and `vf.py` are the only files at the root; `data_pull` with a `script_name` creates all of it.
 - Pulled data lands in `raw_pulls/`, not `input_folder/`.
 - The answer lands in `final_output/`, not `output_folder/`. A merged table
   always; images too when the question asked for them.
@@ -1543,7 +1543,42 @@ def _script_folders(script_name: str) -> dict:
         path = folder / sub
         path.mkdir(parents=True, exist_ok=True)
         paths[sub] = path
+    paths["files"] = _ensure_track0_files(paths)
     return paths
+
+
+# The vendored puller and its first step ship as real files in the wheel, not
+# as strings in this module, so they stay lintable, testable and diffable — and
+# byte-identical to the copy the published-app template carries.
+_SCAFFOLD_DIR = Path(__file__).parent / "scaffold"
+
+
+def _copy_scaffold_file(source_name: str, dest: Path) -> str:
+    """Never overwrite: a follow-up question reuses the same folder, and by
+    then the user (or the model) has edited both of these files."""
+    if dest.exists():
+        return "present"
+    source = _SCAFFOLD_DIR / source_name
+    if not source.is_file():
+        return "unavailable"
+    try:
+        shutil.copyfile(source, dest)
+    except OSError as e:
+        # A folder that exists is still usable; losing the vendored file is
+        # worth a line in the log, not a failed scaffold.
+        print(f"[Track0] could not write {dest}: {e}")
+        return "unavailable"
+    return "written"
+
+
+def _ensure_track0_files(paths: dict) -> dict:
+    """vf.py beside app.py and the steps/step1_pull.py stub. Written wherever a
+    Track 0 folder is created — a query that names a script_name lands a cut in
+    a folder whose puller is already there."""
+    return {
+        "vf_py": _copy_scaffold_file("vf.py", paths["folder"] / "vf.py"),
+        "step1_pull": _copy_scaffold_file("step1_pull.py", paths["steps"] / "step1_pull.py"),
+    }
 
 
 class Track0ScaffoldRequest(BaseModel):
@@ -1552,8 +1587,9 @@ class Track0ScaffoldRequest(BaseModel):
 
 @app.post("/api/track0/scaffold")
 async def track0_scaffold(req: Track0ScaffoldRequest):
-    """Create (or silently reuse) the Track 0 folder for one question, and make
-    sure the project has the rulebook the model is about to write against."""
+    """Create (or silently reuse) the Track 0 folder for one question, drop in
+    the vendored puller and its first step, and make sure the project has the
+    rulebook the model is about to write against."""
     paths = _script_folders(req.script_name)
     agents_md = await _ensure_agents_md(state.project_folder, overwrite=False)
     await _after_download()
@@ -1565,6 +1601,8 @@ async def track0_scaffold(req: Track0ScaffoldRequest):
         "final_output": str(paths["final_output"]),
         "reused": paths["reused"],
         "agents_md": agents_md,
+        "vf_py": paths["files"]["vf_py"],
+        "step1_pull": paths["files"]["step1_pull"],
     }
 
 

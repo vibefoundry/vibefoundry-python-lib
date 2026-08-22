@@ -68,4 +68,4 @@ Repository = "https://github.com/vibefoundry/vibefoundry-python-lib"
 where = ["src"]
 
 [tool.setuptools.package-data]
-vibefoundry = ["static/**/*", "pane/*.html"]
+vibefoundry = ["static/**/*", "pane/*.html", "scaffold/*.py"]
