@@ -582,3 +582,95 @@
 .pubdata-modal-backdrop {
   z-index: 1200;
 }
+
+/* --- Organization catalogue ---------------------------------------------
+   Same card shell as a public dataset, but an organization has no fixed
+   preview to show — it has a connection state, a countdown, and whatever
+   tables that hub granted. So the card stacks instead of splitting in two. */
+.orgcat-card {
+  padding: 0.9rem 1.1rem 1rem;
+}
+
+.orgcat-card + .orgcat-card,
+.orgcat-add {
+  margin-top: 1rem;
+}
+
+.orgcat-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.orgcat-identity { min-width: 0; }
+
+.orgcat-name {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+/* The hub address is the sovereignty claim made visible: this is the only
+   machine the connection ever talks to. Truncated, never wrapped. */
+.orgcat-hub {
+  margin-top: 0.15rem;
+  font-size: 0.75rem;
+  color: #64748b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.orgcat-actions {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.orgcat-status {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.65rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.orgcat-status.is-on { color: #15803d; }
+
+.orgcat-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #cbd5e1;
+  flex-shrink: 0;
+}
+
+.orgcat-status.is-on .orgcat-dot { background: #16a34a; }
+
+/* Capped rather than fixed: three granted tables shouldn't leave a dead pane,
+   forty shouldn't push the next org off the modal. */
+.orgcat-tables {
+  margin-top: 0.7rem;
+  max-height: 220px;
+}
+
+.orgcat-tables td:first-child { max-width: 420px; }
+
+.orgcat-add-title {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.orgcat-add-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.55rem 0 0.35rem;
+}
+
+.orgcat-add-row .dialog-input { flex: 1; min-width: 0; }

@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import math
+import re
 import asyncio
 import base64
 import secrets
@@ -14,6 +15,8 @@ import shutil
 import signal
 import time
 import urllib.parse
+import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Safe despite __init__ importing cli: __version__ is bound before that import,
@@ -83,6 +86,10 @@ from pydantic import BaseModel
 from vibefoundry.runner import discover_scripts, run_script, setup_project_structure, ScriptResult, stop_all_scripts, list_running_processes, stop_process
 from vibefoundry.metadata import generate_metadata
 from vibefoundry.watcher import FileWatcher
+from vibefoundry.organizations import (
+    ORGANIZATIONS, PUBLIC_ORG_ID, PUBLIC_ORG_NAME,
+    find_organization, normalize_hub_url, normalize_gateway_url, org_hint_from_hub_url,
+)
 from vibefoundry.profiler import (
     is_file_massive, get_profile_cache_path, is_profile_valid,
     profile_large_file, read_cached_profile, estimate_filtered_rows,
@@ -105,6 +112,11 @@ class AppState:
     # a native webview (not framed) and forbids query strings in its config
     # URLs, which killed every client-side detection in turn.
     pane_mode: bool = False
+    # True when something outside the UI wants the Organization Catalogue on
+    # screen — the plugin sets it from connect_organization, because a tool
+    # call has no way to reach into the already-loaded frontend. Read once at
+    # boot and by the health poll, same contract as pane_mode.
+    open_org_catalog: bool = False
 
 
 class DataFrameState:
@@ -440,6 +452,7 @@ async def health_check():
         "version": __version__,
         "project_folder": str(state.project_folder) if state.project_folder else None,
         "pane_mode": state.pane_mode,
+        "open_org_catalog": state.open_org_catalog,
     }
 
 
@@ -452,6 +465,13 @@ async def set_pane_mode(request: PaneModeRequest):
     """Mark this backend as pane-hosted (called by the host plugin, not the UI)."""
     state.pane_mode = bool(request.enabled)
     return {"status": "ok", "pane_mode": state.pane_mode}
+
+
+@app.post("/api/ui/org-catalog")
+async def set_open_org_catalog(request: PaneModeRequest):
+    """Ask the UI to open the Organization Catalogue (called by the plugin)."""
+    state.open_org_catalog = bool(request.enabled)
+    return {"status": "ok", "open_org_catalog": state.open_org_catalog}
 
 
 class LaunchTerminalRequest(BaseModel):
@@ -695,7 +715,15 @@ async def auth_sign_out():
     return {"signedIn": False}
 
 
-def _auth_callback_html(error: str = "") -> str:
+def _auth_callback_html(
+    error: str = "",
+    page_title: str = "VibeFoundry — Sign-in complete",
+    heading: str = "Signed in!",
+    failed_heading: str = "Sign-in failed",
+) -> str:
+    # The headings are parameters so /org/callback can land on the same page
+    # with its own wording instead of telling a user who just connected an
+    # organization that they "signed in".
     if error:
         body = f'<p class="msg" style="color:#dc2626">{error}</p>'
     else:
@@ -704,7 +732,7 @@ def _auth_callback_html(error: str = "") -> str:
             '<script>setTimeout(() => { try { window.close() } catch (e) {} }, 1500)</script>'
         )
     return f"""<!doctype html>
-<html><head><title>VibeFoundry — Sign-in complete</title>
+<html><head><title>{page_title}</title>
 <style>
   body {{ font-family: system-ui, sans-serif; background: #ffffff;
          background-image: linear-gradient(rgba(37,99,235,0.11) 1px, transparent 1px),
@@ -718,7 +746,7 @@ def _auth_callback_html(error: str = "") -> str:
   h1 {{ font-size: 22px; color: #0f172a; margin: 0 0 12px; }}
   .msg {{ font-size: 14px; color: #475569; margin: 0; }}
 </style></head>
-<body><div class="card"><h1>{'Sign-in failed' if error else 'Signed in!'}</h1>{body}</div></body></html>
+<body><div class="card"><h1>{failed_heading if error else heading}</h1>{body}</div></body></html>
 """
 
 
@@ -786,14 +814,23 @@ async def _cascade_templates_via_proxy(dest_root: Path, jwt: str, subpath: str =
 # Written to the project root when Build runs and no `.env` is there yet. The
 # remote copy at IDE-Agents/env.template wins when it's reachable, so the
 # gateway URL and the key list can change without a package release.
+#
+# No blank VF_APP_ID / VF_APP_KEY here on purpose: empty keys read as
+# "fill these in", and agents duly stopped to ask the user for a credential
+# they don't need. Reading org data is what Organizations + the data_query
+# tool are for, and that path carries its own short-lived credential.
 DEFAULT_ENV_TEMPLATE = """\
 # VibeFoundry secrets. Git-ignored — never commit or share this file.
-# Paste the values shown when your portal app credential was minted.
+#
+# You do NOT need a credential here to explore or query your organization's
+# data — connect through Organizations in the IDE and ask your question.
+#
+# An App Credential belongs here only for an app you publish, because a
+# published app runs when you are not signed in. Mint one in the portal's
+# App Credentials tab and add VF_APP_ID / VF_APP_KEY beside the gateway.
 
 # Citizen Engineering Portal data gateway
 VF_GATEWAY=https://data-gateway-625603147835.us-central1.run.app
-VF_APP_ID=
-VF_APP_KEY=
 """
 
 
@@ -1159,6 +1196,22 @@ def _safe_dest(folder: Path, filename: str) -> Path:
     return dest
 
 
+async def _public_dataset_meta(client: httpx.AsyncClient, dataset_id: str) -> dict:
+    """The per-dataset json, which is what knows the parquet's filename; the
+    manifest only carries display metadata.
+
+    A single-page app answers unknown paths with index.html and a 200, so
+    raise_for_status() cannot tell us the id was bogus — only failing to parse
+    JSON can. Treat that as "no such dataset" rather than letting a decode
+    error surface as a 502."""
+    res = await client.get(f"{PUBLIC_DATA_BASE_URL}/{dataset_id}.json")
+    res.raise_for_status()
+    try:
+        return res.json()
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"No public dataset named '{dataset_id}'")
+
+
 async def _after_download() -> None:
     """Refresh metadata and the file watcher so the new file shows up in the
     tree immediately, the same way a template download does. _restart_watcher
@@ -1273,22 +1326,7 @@ async def download_public_data(req: DataDownloadRequest):
 
     try:
         async with httpx.AsyncClient(timeout=_DATA_TIMEOUT, follow_redirects=True) as client:
-            # The per-dataset json is what knows the parquet's filename; the
-            # manifest only carries display metadata.
-            #
-            # A single-page app answers unknown paths with index.html and a
-            # 200, so raise_for_status() cannot tell us the id was bogus —
-            # only failing to parse JSON can. Treat that as "no such dataset"
-            # rather than letting a decode error surface as a 502.
-            meta_res = await client.get(f"{PUBLIC_DATA_BASE_URL}/{req.dataset_id}.json")
-            meta_res.raise_for_status()
-            try:
-                meta = meta_res.json()
-            except ValueError:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No public dataset named '{req.dataset_id}'",
-                )
+            meta = await _public_dataset_meta(client, req.dataset_id)
 
             source_file = meta.get("sourceFile") or f"{req.dataset_id}.parquet"
             url = meta.get("downloadUrl") or f"{PUBLIC_DATA_BASE_URL}/{source_file}"
@@ -1308,6 +1346,775 @@ async def download_public_data(req: DataDownloadRequest):
     return {
         "success": True,
         "dataset_id": req.dataset_id,
+        "filename": dest.name,
+        "bytes": dest.stat().st_size,
+    }
+
+
+# --- Organizations: connect, catalogue, query --------------------------------
+#
+# The IDE talks straight to the client's own hub and gateway. Nothing in this
+# section touches vibefoundry.ai: the hub mints a short-lived personal
+# credential, the gateway answers SQL against it, and the credential is stored
+# only on this machine. That is the sovereignty guarantee, and it is why the
+# org list is bundled (see organizations.py) rather than looked up remotely.
+#
+# The credential itself never leaves this file's helpers — /api/org/status,
+# /api/org/list and /api/health return connection facts, never a key.
+
+_ORG_STATE_TTL_SECONDS = 600  # 10 minutes, same as the sign-in nonce
+_pending_org_states: dict[str, dict] = {}  # nonce -> {"hub_url": str, "expires": ts}
+
+_ORG_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
+
+# Rows returned inline by /api/org/query. Anything past this spills to a
+# parquet in output_folder/queries/ — an LLM caller cannot read 200k rows, and
+# a pane cannot render them, but a script downstream can read the file.
+QUERY_PREVIEW_ROWS = 500
+
+
+class OrgReauthRequired(Exception):
+    """The org's stored credential is gone or was refused. Raised deep in a
+    gateway call so every endpoint can answer with the reconnect handshake
+    instead of an error the UI would have to special-case."""
+
+    def __init__(self, org_id: str):
+        super().__init__(org_id)
+        self.org_id = org_id
+
+
+def _reauth_response(org_id: str) -> dict:
+    return {"status": "reauth_required", "org_id": org_id}
+
+
+def _orgs_store_path() -> Path:
+    home = Path.home() / ".vibefoundry"
+    home.mkdir(parents=True, exist_ok=True)
+    return home / "orgs.json"
+
+
+def _parse_iso_ts(value) -> Optional[float]:
+    """ISO-8601 → unix seconds, or None if it can't be read. The hub mints
+    `expires` with a trailing 'Z', which fromisoformat rejects before 3.11,
+    so swap it for the offset it stands for."""
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _write_orgs(orgs: dict) -> None:
+    """Persist the org store 0600. The mode is set at creation rather than
+    chmod'ed afterwards, because the file holds live gateway keys and even a
+    brief world-readable window is a leak."""
+    path = _orgs_store_path()
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"orgs": orgs}, indent=2))
+    try:
+        os.chmod(path, 0o600)  # a file that already existed keeps its old mode
+    except OSError:
+        pass
+
+
+def _read_orgs() -> dict:
+    """Stored org credentials keyed by org_id, with expired ones dropped.
+
+    Pruning happens on read so an expired credential never reaches a request:
+    the endpoint sees "not connected" and asks for a reconnect, instead of
+    spending a round trip discovering the gateway agrees."""
+    path = _orgs_store_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    orgs = data.get("orgs")
+    if not isinstance(orgs, dict):
+        return {}
+
+    now = time.time()
+    live = {}
+    for org_id, entry in orgs.items():
+        if not isinstance(entry, dict) or not entry.get("app_id") or not entry.get("app_key"):
+            continue
+        expires_at = _parse_iso_ts(entry.get("expires"))
+        # An unreadable or absent expiry is not treated as expired — the
+        # gateway is the authority, and a 401 there drives the reconnect.
+        if expires_at is not None and expires_at <= now:
+            continue
+        live[org_id] = entry
+
+    if len(live) != len(orgs):
+        _write_orgs(live)
+    return live
+
+
+def _org_entry(org_id: str) -> Optional[dict]:
+    return _read_orgs().get(str(org_id or "").strip())
+
+
+def _drop_org(org_id: str) -> bool:
+    orgs = _read_orgs()
+    if org_id not in orgs:
+        return False
+    orgs.pop(org_id, None)
+    _write_orgs(orgs)
+    return True
+
+
+def _org_public_view(entry: dict) -> dict:
+    """Connection facts for one org. Built field by field on purpose: a
+    dict-minus-the-key would leak any secret field added here later."""
+    expires_at = _parse_iso_ts(entry.get("expires"))
+    return {
+        "org_id": entry.get("org_id"),
+        "org_name": entry.get("org_name"),
+        "hub_url": entry.get("hub_url"),
+        "gateway": entry.get("gateway"),
+        "email": entry.get("email"),
+        "expires": entry.get("expires"),
+        "seconds_to_expiry": (
+            max(0, int(expires_at - time.time())) if expires_at is not None else None
+        ),
+        "connected_at": entry.get("connected_at"),
+        "tables": entry.get("tables"),
+    }
+
+
+def _purge_expired_org_states() -> None:
+    now = time.time()
+    for nonce in [n for n, v in _pending_org_states.items() if v.get("expires", 0) < now]:
+        _pending_org_states.pop(nonce, None)
+
+
+def _valid_table_id(tid: str) -> bool:
+    """Wider than _valid_dataset_id: an org's catalogue ids are the client's
+    to choose, so capitals and hyphens are allowed. Still an allow-list — the
+    value is interpolated into a gateway URL path."""
+    if not tid or len(tid) > 128:
+        return False
+    return all(c.isalnum() or c in ("_", "-") for c in tid)
+
+
+async def _gateway_request(entry: dict, method: str, path: str, json_body: Optional[dict] = None) -> httpx.Response:
+    """One authenticated call to an org's gateway.
+
+    A 401/403 means the personal credential expired or was revoked, so the
+    stored copy is dropped here rather than left to fail again on the next
+    call, and the caller is told to send the user back through /api/org/connect."""
+    url = str(entry.get("gateway", "")).rstrip("/") + path
+    headers = {"Authorization": f"Bearer {entry['app_id']}.{entry['app_key']}"}
+    try:
+        async with httpx.AsyncClient(timeout=_ORG_TIMEOUT, follow_redirects=True) as client:
+            res = await client.request(method, url, headers=headers, json=json_body)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach {entry.get('org_name') or entry.get('org_id')}: {e}")
+
+    if res.status_code in (401, 403):
+        _drop_org(entry.get("org_id"))
+        raise OrgReauthRequired(entry.get("org_id"))
+    return res
+
+
+def _raise_for_gateway_error(res: httpx.Response) -> None:
+    """Re-raise a gateway refusal as our own, carrying its message through.
+    401/403 never reach here — _gateway_request turns those into a reconnect."""
+    if res.status_code < 400:
+        return
+    try:
+        detail = res.json().get("detail", "")
+    except Exception:
+        detail = res.text[:500]
+    raise HTTPException(status_code=res.status_code, detail=detail or f"Gateway returned {res.status_code}")
+
+
+def _gateway_json(res: httpx.Response) -> dict:
+    _raise_for_gateway_error(res)
+    try:
+        return res.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Gateway returned a non-JSON response")
+
+
+def _require_org(org_id: str) -> dict:
+    entry = _org_entry(org_id)
+    if not entry:
+        raise OrgReauthRequired(org_id)
+    return entry
+
+
+# --- SQL guard rails ---------------------------------------------------------
+#
+# The gateway enforces its own copy of these rules and is the authority for
+# org queries. This copy exists for the public path, where THIS process is the
+# one executing the SQL: without it, `SELECT * FROM read_parquet('~/.ssh/id_rsa')`
+# would be a working local file read dressed up as a data question.
+
+_SQL_BANNED = re.compile(
+    r"\b(read_parquet|read_csv|read_ndjson|scan_\w+|COPY|ATTACH|INSERT|UPDATE"
+    r"|DELETE|CREATE|DROP|ALTER|TRUNCATE|GRANT|EXECUTE)\b",
+    re.IGNORECASE,
+)
+_SQL_TABLE_REF = re.compile(r'\b(?:FROM|JOIN)\s+"?([A-Za-z_][A-Za-z0-9_\-]*)"?', re.IGNORECASE)
+
+
+def _validate_local_sql(sql: str) -> str:
+    """Return the single SELECT statement to execute, or raise 400."""
+    text = (sql or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No SQL supplied")
+    # Comments are rejected rather than stripped: stripping is where smuggling
+    # gets in, because the stripper and the parser never agree on the edges.
+    if "--" in text or "/*" in text:
+        raise HTTPException(status_code=400, detail="SQL comments are not allowed")
+    if text.endswith(";"):
+        text = text[:-1].rstrip()
+    if ";" in text:
+        raise HTTPException(status_code=400, detail="Only one statement per query")
+    if not re.match(r"^(SELECT|WITH)\b", text, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="Query must start with SELECT or WITH")
+    banned = _SQL_BANNED.search(text)
+    if banned:
+        raise HTTPException(status_code=400, detail=f"'{banned.group(1)}' is not allowed in a query")
+    return text
+
+
+def _referenced_tables(sql: str) -> list[str]:
+    seen = []
+    for match in _SQL_TABLE_REF.finditer(sql or ""):
+        name = match.group(1)
+        if name.lower() not in ("select", "lateral") and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _json_scalar(v):
+    """NaN/Inf are valid float() but not valid JSON; the frontend's fetch
+    rejects the whole payload when one slips through."""
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    return v
+
+
+def _frame_to_rows(df: pl.DataFrame) -> tuple[list[str], list[list]]:
+    """Columns + row lists, JSON-safe. polars' own writer is used for the
+    conversion so dates, durations and decimals arrive as strings instead of
+    objects the encoder chokes on."""
+    columns = list(df.columns)
+    if df.height == 0:
+        return columns, []
+    records = json.loads(df.write_json())
+    return columns, [[_json_scalar(rec.get(c)) for c in columns] for rec in records]
+
+
+def _queries_folder() -> Optional[Path]:
+    if not state.project_folder:
+        return None
+    folder = state.project_folder / "output_folder" / "queries"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _query_result_stem(tables_used: list) -> str:
+    base = ""
+    if tables_used:
+        base = "".join(c if (c.isalnum() or c in ("_", "-")) else "_" for c in str(tables_used[0]))
+    return f"{base or 'query'}_{time.strftime('%Y%m%d_%H%M%S')}"
+
+
+def _spill_result(df: pl.DataFrame, tables_used: list) -> Optional[str]:
+    """Write a too-big result to output_folder/queries/ and return its path.
+    Returns None when there is no project folder — the preview still answers
+    the question, and losing the spill is better than failing the query."""
+    folder = _queries_folder()
+    if folder is None:
+        return None
+    dest = folder / f"{_query_result_stem(tables_used)}.parquet"
+    df.write_parquet(dest)
+    return str(dest)
+
+
+async def _ensure_public_parquet(dataset_id: str, force: bool = False) -> tuple[Path, dict]:
+    """The public dataset's parquet on disk in input_folder/, downloading it
+    only if it isn't already there. Questions about public data are answered
+    locally, so the file has to exist — but a second question about the same
+    dataset must not re-download 4 MB to ask it."""
+    if not _valid_dataset_id(dataset_id):
+        raise HTTPException(status_code=400, detail="Invalid dataset_id")
+    folder = _input_folder()
+    async with httpx.AsyncClient(timeout=_DATA_TIMEOUT, follow_redirects=True) as client:
+        meta = await _public_dataset_meta(client, dataset_id)
+        source_file = meta.get("sourceFile") or f"{dataset_id}.parquet"
+        dest = _safe_dest(folder, source_file)
+        if force or not dest.exists():
+            url = meta.get("downloadUrl") or f"{PUBLIC_DATA_BASE_URL}/{source_file}"
+            file_res = await client.get(url)
+            file_res.raise_for_status()
+            dest.write_bytes(file_res.content)
+    return dest, meta
+
+
+async def _public_manifest() -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=_DATA_TIMEOUT) as client:
+            res = await client.get(f"{PUBLIC_DATA_BASE_URL}/manifest.json")
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not fetch public catalog: {e}")
+
+
+async def _collect_public_sql(sql: str, limit: Optional[int]) -> tuple:
+    """Execute SQL over public datasets locally with polars, returning
+    (DataFrame, tables_used, elapsed_ms).
+
+    Every table the SQL names is resolved against the public manifest and
+    registered as a LazyFrame under its catalogue id, so the same SQL a user
+    would send to a gateway works here unchanged."""
+    statement = _validate_local_sql(sql)
+    referenced = _referenced_tables(statement)
+    manifest = await _public_manifest()
+    known = {d.get("id") for d in manifest.get("datasets", []) if d.get("id")}
+    wanted = [t for t in referenced if t in known]
+    if not wanted:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No public dataset matches {referenced or 'the tables in this query'}. "
+                "Call /api/org/catalog for the ids that exist."
+            ),
+        )
+
+    frames = {}
+    for table_id in wanted:
+        path, _ = await _ensure_public_parquet(table_id)
+        frames[table_id] = pl.scan_parquet(path)
+
+    started = time.time()
+    try:
+        lazy = pl.SQLContext(frames=frames).execute(statement)
+        if limit and limit > 0:
+            lazy = lazy.limit(int(limit))
+        df = await asyncio.to_thread(lazy.collect)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Contract: a bad query is the caller's 400, never our 500.
+        raise HTTPException(status_code=400, detail=str(e)[:500])
+    return df, wanted, int((time.time() - started) * 1000)
+
+
+async def _run_public_sql(sql: str, limit: Optional[int]) -> dict:
+    df, wanted, elapsed_ms = await _collect_public_sql(sql, limit)
+    columns, rows = _frame_to_rows(df.head(QUERY_PREVIEW_ROWS))
+    spilled = _spill_result(df, wanted) if df.height > QUERY_PREVIEW_ROWS else None
+    return {
+        "status": "ok",
+        "org_id": PUBLIC_ORG_ID,
+        "columns": columns,
+        "rows": rows,
+        "row_count": df.height,
+        "preview_rows": len(rows),
+        "truncated": False,
+        "tables_used": wanted,
+        "elapsed_ms": elapsed_ms,
+        "spilled_to": spilled,
+    }
+
+
+async def _run_org_sql(entry: dict, sql: str, limit: Optional[int]) -> dict:
+    body = {"sql": sql, "format": "json"}
+    if limit and limit > 0:
+        body["limit"] = int(limit)
+    # No client-side SQL validation on this path: the gateway enforces the
+    # lock-down and is the authority, and a second, drifting copy of the rules
+    # here would start rejecting queries the gateway is happy to run.
+    res = await _gateway_request(entry, "POST", "/v1/query", json_body=body)
+    payload = _gateway_json(res)
+
+    columns = payload.get("columns") or []
+    rows = payload.get("rows") or []
+    row_count = payload.get("row_count", len(rows))
+    spilled = None
+    if len(rows) > QUERY_PREVIEW_ROWS:
+        try:
+            spilled = _spill_result(pl.DataFrame(rows, schema=columns, orient="row"), payload.get("tables_used") or [])
+        except Exception as e:
+            print(f"[Org] could not spill query result: {e}")
+        rows = rows[:QUERY_PREVIEW_ROWS]
+
+    return {
+        "status": "ok",
+        "org_id": entry.get("org_id"),
+        "columns": columns,
+        "rows": [[_json_scalar(v) for v in row] for row in rows],
+        "row_count": row_count,
+        "preview_rows": len(rows),
+        "truncated": bool(payload.get("truncated")),
+        "tables_used": payload.get("tables_used") or [],
+        "elapsed_ms": payload.get("elapsed_ms"),
+        "spilled_to": spilled,
+    }
+
+
+# --- Organization endpoints --------------------------------------------------
+
+
+class OrgConnectRequest(BaseModel):
+    org_id: Optional[str] = None
+    hub_url: Optional[str] = None
+
+
+class OrgDisconnectRequest(BaseModel):
+    org_id: str
+
+
+class OrgQueryRequest(BaseModel):
+    org_id: str
+    sql: str
+    limit: Optional[int] = None
+
+
+class OrgPullRequest(BaseModel):
+    org_id: str
+    table_id: str = ""
+    sql: Optional[str] = None
+    filename: Optional[str] = None
+
+
+@app.get("/api/org/list")
+async def org_list():
+    """The bundled organizations plus whether each is connected. Orgs reached
+    by a pasted hub URL aren't in the bundle, so connected-but-unlisted ones
+    are appended — otherwise they'd vanish from the picker after connecting."""
+    connected = _read_orgs()
+    listed = []
+    seen = set()
+    for org in ORGANIZATIONS:
+        entry = connected.get(org["id"])
+        seen.add(org["id"])
+        listed.append({
+            **org,
+            "connected": bool(entry),
+            "connection": _org_public_view(entry) if entry else None,
+        })
+    for org_id, entry in connected.items():
+        if org_id in seen:
+            continue
+        listed.append({
+            "id": org_id,
+            "name": entry.get("org_name") or org_id,
+            "hub_url": entry.get("hub_url"),
+            "logo": None,
+            "connected": True,
+            "connection": _org_public_view(entry),
+        })
+    return {
+        "organizations": listed,
+        "public": {"id": PUBLIC_ORG_ID, "name": PUBLIC_ORG_NAME, "connected": True},
+    }
+
+
+@app.post("/api/org/connect")
+async def org_connect(req: OrgConnectRequest, request: Request):
+    """Start the hub handshake: mint a nonce, then open the hub's /connect in
+    the user's browser pointed back at this backend's /org/callback."""
+    _purge_expired_org_states()
+
+    if req.hub_url:
+        try:
+            hub_url = normalize_hub_url(req.hub_url)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        org_hint = org_hint_from_hub_url(hub_url)
+    elif req.org_id:
+        org = find_organization(req.org_id)
+        if not org:
+            raise HTTPException(status_code=404, detail=f"Unknown organization '{req.org_id}'")
+        hub_url = org["hub_url"]
+        org_hint = org["id"]
+    else:
+        raise HTTPException(status_code=400, detail="Supply an org_id or a hub_url")
+
+    nonce = secrets.token_urlsafe(32)
+    _pending_org_states[nonce] = {"hub_url": hub_url, "expires": time.time() + _ORG_STATE_TTL_SECONDS}
+
+    # The Host header, not a hardcoded port: the backend binds whatever port
+    # was free, and the hub only accepts a loopback callback.
+    host = request.headers.get("host", "127.0.0.1:8765")
+    callback_url = f"http://{host}/org/callback"
+    connect_url = (
+        f"{hub_url}/connect"
+        f"?state={nonce}"
+        f"&callback={urllib.parse.quote(callback_url, safe='')}"
+    )
+
+    # Unlike /api/auth/start, which hands the URL back for the frontend to
+    # open, this process opens the browser itself: connect is driven from a
+    # plugin tool call as often as from the UI, and a sandboxed pane cannot
+    # open a top-level window. The URL is still returned so the UI can offer
+    # it as a link when webbrowser has nothing to launch.
+    opened = await asyncio.to_thread(webbrowser.open, connect_url)
+    state.open_org_catalog = True
+
+    return {
+        "status": "opened",
+        "org_id": org_hint,
+        "hub_url": hub_url,
+        "url": connect_url,
+        "browser_opened": bool(opened),
+    }
+
+
+@app.get("/org/callback")
+async def org_callback(
+    # Aliased because a parameter called `state` would shadow the module-level
+    # AppState for the whole function body.
+    state_nonce: str = Query("", alias="state"),
+    app_id: str = "",
+    app_key: str = "",
+    gateway: str = "",
+    org_id: str = "",
+    org_name: str = "",
+    email: str = "",
+    expires: str = "",
+    tables: str = "",
+    error: str = "",
+):
+    """Receives the hub's redirect carrying a freshly minted personal
+    credential, validates the nonce, and stores it 0600."""
+    page = {
+        "page_title": "VibeFoundry — Organization connected",
+        "heading": "Connected!",
+        "failed_heading": "Connection failed",
+    }
+    if error:
+        return HTMLResponse(_auth_callback_html(error=error[:300], **page), status_code=400)
+
+    _purge_expired_org_states()
+    pending = _pending_org_states.pop(state_nonce, None) if state_nonce else None
+    if not pending:
+        return HTMLResponse(
+            _auth_callback_html(error="Invalid or expired connection attempt. Try again from the IDE.", **page),
+            status_code=400,
+        )
+    if not (app_id and app_key and gateway and org_id):
+        return HTMLResponse(
+            _auth_callback_html(error="The hub's response was missing credential fields.", **page),
+            status_code=400,
+        )
+
+    try:
+        gateway_url = normalize_gateway_url(gateway)
+    except ValueError:
+        return HTMLResponse(_auth_callback_html(error="The hub sent an unusable gateway URL.", **page), status_code=400)
+
+    try:
+        table_count = int(tables)
+    except (TypeError, ValueError):
+        table_count = None
+
+    orgs = _read_orgs()
+    orgs[org_id] = {
+        "org_id": org_id,
+        "org_name": org_name or org_id,
+        "hub_url": pending["hub_url"],
+        "gateway": gateway_url,
+        "app_id": app_id,
+        "app_key": app_key,
+        "email": email,
+        "expires": expires,
+        "connected_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "tables": table_count,
+    }
+    _write_orgs(orgs)
+    # The user came back from connecting; show them what they just gained.
+    state.open_org_catalog = True
+    return HTMLResponse(_auth_callback_html(**page))
+
+
+@app.get("/api/org/status")
+async def org_status():
+    """Which orgs are connected, as whom, and for how much longer. Never the key."""
+    return {"organizations": [_org_public_view(e) for e in _read_orgs().values()]}
+
+
+@app.post("/api/org/disconnect")
+async def org_disconnect(req: OrgDisconnectRequest):
+    return {"status": "ok", "org_id": req.org_id, "disconnected": _drop_org(req.org_id)}
+
+
+@app.get("/api/org/catalog")
+async def org_catalog():
+    """Every connected org's tables plus the public library, in one shape.
+
+    One org being unreachable must not blank the catalogue — its failure is
+    reported alongside the tables that did load, exactly as a missing public
+    dataset doesn't blank the public page."""
+    tables: list[dict] = []
+    errors: list[dict] = []
+    reauth: list[str] = []
+
+    for entry in _read_orgs().values():
+        org_id = entry.get("org_id")
+        try:
+            res = await _gateway_request(entry, "GET", "/v1/tables")
+            payload = _gateway_json(res)
+        except OrgReauthRequired:
+            reauth.append(org_id)
+            continue
+        except HTTPException as e:
+            errors.append({"org_id": org_id, "error": str(e.detail)})
+            continue
+        for table in payload.get("tables", []):
+            tables.append({
+                "source": "org",
+                "org_id": org_id,
+                "org_name": entry.get("org_name"),
+                "id": table.get("id"),
+                "title": table.get("title") or table.get("id"),
+                "rows": table.get("rows"),
+                "columns": table.get("columns") or [],
+            })
+
+    try:
+        manifest = await _public_manifest()
+    except HTTPException as e:
+        errors.append({"org_id": PUBLIC_ORG_ID, "error": str(e.detail)})
+        manifest = {"datasets": []}
+
+    entries = [d for d in manifest.get("datasets", []) if d.get("id")]
+    async with httpx.AsyncClient(timeout=_DATA_TIMEOUT) as client:
+        async def columns_for(did: str):
+            # The manifest carries counts, not column names; the per-dataset
+            # json is where those live. A missing one costs column names, not
+            # the row.
+            try:
+                res = await client.get(f"{PUBLIC_DATA_BASE_URL}/{did}.json")
+                res.raise_for_status()
+                body = res.json()
+                return [c.get("name") for c in body.get("columns", []) if c.get("name")]
+            except Exception:
+                return []
+
+        column_lists = await asyncio.gather(*(columns_for(d["id"]) for d in entries))
+
+    for dataset, columns in zip(entries, column_lists):
+        tables.append({
+            "source": "public",
+            "org_id": PUBLIC_ORG_ID,
+            "org_name": PUBLIC_ORG_NAME,
+            "id": dataset.get("id"),
+            "title": dataset.get("title") or dataset.get("id"),
+            "rows": dataset.get("rowCount"),
+            "columns": columns,
+        })
+
+    return {"tables": tables, "errors": errors, "reauth_required": reauth}
+
+
+@app.get("/api/org/schema/{org_id}/{table_id}")
+async def org_schema(org_id: str, table_id: str):
+    """One table's column profile — what a caller reads before writing SQL."""
+    if not _valid_table_id(table_id):
+        raise HTTPException(status_code=400, detail="Invalid table_id")
+
+    if org_id == PUBLIC_ORG_ID:
+        async with httpx.AsyncClient(timeout=_DATA_TIMEOUT) as client:
+            meta = await _public_dataset_meta(client, table_id)
+        return {
+            "source": "public",
+            "org_id": PUBLIC_ORG_ID,
+            "id": meta.get("id", table_id),
+            "title": meta.get("title", table_id),
+            "description": meta.get("description", ""),
+            "rows": meta.get("rowCount"),
+            "refreshedAt": meta.get("refreshedAt", ""),
+            "columns": meta.get("columns", []),
+        }
+
+    try:
+        entry = _require_org(org_id)
+        res = await _gateway_request(entry, "GET", f"/v1/tables/{table_id}/schema")
+        payload = _gateway_json(res)
+    except OrgReauthRequired as e:
+        return _reauth_response(e.org_id)
+    return {"source": "org", "org_id": org_id, **payload}
+
+
+@app.post("/api/org/query")
+async def org_query(req: OrgQueryRequest):
+    """Answer a question with SQL, at the gateway for an org and locally for
+    public data. This is the path that means a question costs a few hundred
+    rows rather than a whole-table download."""
+    if req.org_id == PUBLIC_ORG_ID:
+        return await _run_public_sql(req.sql, req.limit)
+    try:
+        entry = _require_org(req.org_id)
+        return await _run_org_sql(entry, req.sql, req.limit)
+    except OrgReauthRequired as e:
+        return _reauth_response(e.org_id)
+
+
+@app.post("/api/org/pull")
+async def org_pull(req: OrgPullRequest):
+    """Land data in input_folder/ for a script to read — a query result when
+    `sql` is given, the whole table when it isn't."""
+    folder = _input_folder()
+
+    if req.org_id == PUBLIC_ORG_ID:
+        if req.sql:
+            df, wanted, _ = await _collect_public_sql(req.sql, None)
+            dest = _safe_dest(folder, req.filename or f"{_query_result_stem(wanted)}.parquet")
+            df.write_parquet(dest)
+        else:
+            if not _valid_dataset_id(req.table_id):
+                raise HTTPException(status_code=400, detail="Invalid table_id")
+            # force=True: an explicit pull is the user asking for current data,
+            # not for whatever copy is already sitting in input_folder.
+            source, _ = await _ensure_public_parquet(req.table_id, force=True)
+            dest = source
+            if req.filename:
+                dest = _safe_dest(folder, req.filename)
+                if dest != source:
+                    shutil.copyfile(source, dest)
+        await _after_download()
+        return {"success": True, "org_id": PUBLIC_ORG_ID, "filename": dest.name, "bytes": dest.stat().st_size}
+
+    if not req.sql and not _valid_table_id(req.table_id):
+        raise HTTPException(status_code=400, detail="Invalid table_id")
+
+    try:
+        entry = _require_org(req.org_id)
+        if req.sql:
+            body = {"sql": req.sql, "format": "parquet"}
+            res = await _gateway_request(entry, "POST", "/v1/query", json_body=body)
+            default_name = f"{req.table_id or 'query'}_cut.parquet"
+        else:
+            res = await _gateway_request(entry, "GET", f"/v1/tables/{req.table_id}")
+            default_name = f"{req.table_id}.parquet"
+    except OrgReauthRequired as e:
+        return _reauth_response(e.org_id)
+
+    _raise_for_gateway_error(res)
+
+    dest = _safe_dest(folder, req.filename or default_name)
+    dest.write_bytes(res.content)
+    await _after_download()
+    return {
+        "success": True,
+        "org_id": req.org_id,
+        "table_id": req.table_id,
         "filename": dest.name,
         "bytes": dest.stat().st_size,
     }

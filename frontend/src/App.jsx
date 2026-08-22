@@ -4,6 +4,7 @@ import FileViewer from './components/FileViewer'
 import FolderPicker from './components/FolderPicker'
 import TemplatePickerModal from './components/TemplatePickerModal'
 import DataPickerModal from './components/DataPickerModal'
+import OrgCatalogModal from './components/OrgCatalogModal'
 import LogsModal from './components/LogsModal'
 import { record, installErrorCapture } from './utils/diagnostics'
 import {
@@ -136,6 +137,32 @@ function App() {
     return () => { cancelled = true }
   }, [])
 
+  // The plugin's connect_organization tool sets a flag on the backend and then
+  // hands the pane back — and the pane is usually ALREADY open when it does,
+  // so a boot-time read of /api/health would miss it. Poll, and act only on the
+  // transition, so closing the modal doesn't fight a flag the backend left set.
+  useEffect(() => {
+    let cancelled = false
+    let armed = false
+    const tick = async () => {
+      try {
+        const res = await fetch('/api/health')
+        if (!res.ok) return
+        const data = await res.json()
+        // open_org_catalog is the name the backend actually serves (set by
+        // POST /api/ui/org-catalog and by /api/org/connect). The older guesses
+        // stay as fallbacks only so a mismatched pair of versions still opens.
+        const wanted = !!(data.open_org_catalog || data.open_org_modal || data.org_modal)
+        if (cancelled) return
+        if (wanted && !armed) setShowOrgModal(true)
+        armed = wanted
+      } catch { /* backendDown already covers an unreachable server */ }
+    }
+    tick()
+    const interval = setInterval(tick, 3000)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [])
+
   // Poll auth status every 2s so when the browser sign-in flow completes
   // and writes the token to disk, the IDE picks it up automatically.
   useEffect(() => {
@@ -211,6 +238,7 @@ function App() {
   const [isScaffolding, setIsScaffolding] = useState(false)
   const [showTemplatesMenu, setShowTemplatesMenu] = useState(false)
   const [showDataModal, setShowDataModal] = useState(false)
+  const [showOrgModal, setShowOrgModal] = useState(false)
   const [dataCatalog, setDataCatalog] = useState(null)
   const [dataCatalogError, setDataCatalogError] = useState(null)
   const [loadingDataCatalog, setLoadingDataCatalog] = useState(false)
@@ -1195,6 +1223,13 @@ function App() {
             >
               Public Data
             </button>
+            <button
+              className="btn-flat"
+              onClick={() => setShowOrgModal(true)}
+              disabled={!projectPath || !canWrite}
+            >
+              Organizations
+            </button>
           </div>
           <div className="top-bar-section top-bar-center" />
           <div className="top-bar-section top-bar-right">
@@ -1395,6 +1430,11 @@ function App() {
         loadingCatalog={loadingDataCatalog}
         onSaved={handleRefresh}
         onClose={() => setShowDataModal(false)}
+      />
+
+      <OrgCatalogModal
+        open={showOrgModal}
+        onClose={() => setShowOrgModal(false)}
       />
 
       {showDeleteConfirm && (
