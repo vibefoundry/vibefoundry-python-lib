@@ -783,11 +783,41 @@ async def _cascade_templates_via_proxy(dest_root: Path, jwt: str, subpath: str =
     return written
 
 
+# Written to the project root when Build runs and no `.env` is there yet. The
+# remote copy at IDE-Agents/env.template wins when it's reachable, so the
+# gateway URL and the key list can change without a package release.
+DEFAULT_ENV_TEMPLATE = """\
+# VibeFoundry secrets. Git-ignored — never commit or share this file.
+# Paste the values shown when your portal app credential was minted.
+
+# Citizen Engineering Portal data gateway
+VF_GATEWAY=https://data-gateway-625603147835.us-central1.run.app
+VF_APP_ID=
+VF_APP_KEY=
+"""
+
+
+def _ensure_gitignored(project_folder: Path, entry: str) -> None:
+    """Add `entry` to .gitignore if it isn't already listed. Build only writes
+    a fresh .gitignore when it runs `git init` itself, so a project that was
+    already a repo would otherwise have nothing ignoring the secrets file."""
+    path = project_folder / ".gitignore"
+    try:
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        if any(line.strip() == entry for line in existing.splitlines()):
+            return
+        separator = "" if (not existing or existing.endswith("\n")) else "\n"
+        path.write_text(f"{existing}{separator}{entry}\n", encoding="utf-8")
+    except OSError as e:
+        print(f"[Build] could not add {entry} to .gitignore: {e}")
+
+
 @app.post("/api/build")
 async def build_project():
-    """Build the project structure — creates the input/output/app folders and
-    fetches AGENTS.md. Templates are no longer cascaded here; the user picks
-    them explicitly via /api/templates/download.
+    """Build the project structure — creates the input/output/app folders,
+    fetches AGENTS.md, and drops a `.env` at the root for data-access secrets.
+    Templates are no longer cascaded here; the user picks them explicitly via
+    /api/templates/download.
     """
     if not state.project_folder:
         raise HTTPException(status_code=400, detail="No project folder selected")
@@ -830,6 +860,36 @@ async def build_project():
         except Exception as e:
             print(f"[Build] Public AGENTS.md fallback also failed: {e}")
 
+    # Claude Code auto-loads CLAUDE.md, not AGENTS.md (the Codex convention).
+    # A one-line import shim makes both assistants read the same rules. Never
+    # overwrite an existing CLAUDE.md — the user may have customized it.
+    claude_dest = state.project_folder / "CLAUDE.md"
+    if not claude_dest.exists():
+        claude_dest.write_text("@AGENTS.md\n", encoding="utf-8")
+
+    # Drop a `.env` at the project root — the one place data-access secrets
+    # live. Never overwrite an existing one: it holds the user's pasted keys.
+    env_dest = state.project_folder / ".env"
+    env_created = False
+    if not env_dest.exists():
+        env_body = DEFAULT_ENV_TEMPLATE
+        if jwt:
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    res = await client.get(
+                        f"{PROXY_BASE_URL}/IDE-Agents/env.template",
+                        headers={
+                            "Authorization": f"Bearer {jwt}",
+                            "Accept": "application/vnd.github.raw",
+                        },
+                    )
+                    if res.status_code == 200 and res.text.strip():
+                        env_body = res.text
+            except Exception as e:
+                print(f"[Build] env.template fetch failed ({e}); using built-in default")
+        env_dest.write_text(env_body, encoding="utf-8")
+        env_created = True
+
     # Initialize git repo if not already one
     git_initialized = False
     git_dir = state.project_folder / ".git"
@@ -871,6 +931,8 @@ async def build_project():
             # git not installed or failed - continue without it
             pass
 
+    _ensure_gitignored(state.project_folder, ".env")
+
     # Generate metadata now that folders exist
     generate_metadata(state.project_folder)
 
@@ -889,6 +951,7 @@ async def build_project():
         "success": True,
         "folders": {k: str(v) for k, v in folders.items()},
         "agents_md_copied": (state.project_folder / "AGENTS.md").exists(),
+        "env_created": env_created,
         "git_initialized": git_initialized
     }
 

@@ -15,6 +15,12 @@ import './App.css'
 function App() {
   const [skipAuth, setSkipAuth] = useState(() => localStorage.getItem('vf_skip_auth') === '1')
   const [authStatus, setAuthStatus] = useState({ signedIn: false, loading: true })
+  // The auth poll doubles as a heartbeat: when the backend process dies, its
+  // fetch rejects (connection refused) rather than returning non-OK. Two
+  // consecutive rejects flip this on so a transient blip can't replace the
+  // IDE with the sleep screen.
+  const [backendDown, setBackendDown] = useState(false)
+  const heartbeatFails = useRef(0)
   // Shown briefly after a fresh sign-in completes — gives the user a
   // confirmation moment before the IDE renders. Triggered by the
   // localStorage 'vf_signin_pending' flag set when startSignIn runs.
@@ -57,13 +63,63 @@ function App() {
   // which scales a different element.
   useEffect(() => {
     const isWindows = /Windows/i.test(navigator.userAgent || '')
-    const dpr = window.devicePixelRatio || 1
-    if (isPane && isWindows && dpr > 1) {
-      document.documentElement.style.zoom = String(1 / dpr)
-    } else if (document.documentElement.style.zoom) {
-      document.documentElement.style.zoom = ''
+    let cleanupDprWatch = null
+    const apply = () => {
+      const dpr = window.devicePixelRatio || 1
+      const active = isPane && isWindows && dpr > 1
+      if (active) {
+        document.documentElement.style.zoom = String(1 / dpr)
+      } else if (document.documentElement.style.zoom) {
+        document.documentElement.style.zoom = ''
+      }
+      // The evidence a Windows cut-off report needs: every application or
+      // skip of the counter-zoom, with the numbers that drove the decision.
+      // Surfaces via Tools → Logs → Copy.
+      record('display.scaling', {
+        applied: active ? String(1 / dpr) : 'none',
+        dpr,
+        isWindows,
+        isPane,
+        clientIsPane,
+        backendPane,
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        outerWidth: window.outerWidth,
+        outerHeight: window.outerHeight,
+        // window.* sizes read 0 in some embedded webviews; these two don't.
+        clientWidth: document.documentElement.clientWidth,
+        clientHeight: document.documentElement.clientHeight,
+        visualViewport: window.visualViewport
+          ? [window.visualViewport.width, window.visualViewport.height, window.visualViewport.scale]
+          : null,
+        screenWidth: window.screen && window.screen.width,
+        screenHeight: window.screen && window.screen.height,
+      })
+      // dpr changes live — moved between monitors, scaling changed, host
+      // zoomed. A one-shot media query fires once at the *current* dpr, so
+      // re-arm on every change and re-run the whole decision.
+      const mq = window.matchMedia(`(resolution: ${dpr}dppx)`)
+      const onChange = () => { if (cleanupDprWatch) cleanupDprWatch(); apply() }
+      mq.addEventListener('change', onChange)
+      cleanupDprWatch = () => mq.removeEventListener('change', onChange)
     }
-  }, [isPane])
+    apply()
+    // The boot-time record often lands before the host has sized the webview
+    // (innerWidth 0), so also capture the settled numbers whenever a resize
+    // finishes — this is where a Windows "renders 2x until a resize" host
+    // would show its hand.
+    let resizeTimer = null
+    const onResize = () => {
+      clearTimeout(resizeTimer)
+      resizeTimer = setTimeout(apply, 500)
+    }
+    window.addEventListener('resize', onResize)
+    return () => {
+      clearTimeout(resizeTimer)
+      window.removeEventListener('resize', onResize)
+      if (cleanupDprWatch) cleanupDprWatch()
+    }
+  }, [isPane, clientIsPane, backendPane])
 
   // Read the version off the backend rather than hardcoding it here, so the
   // footer can't drift from the installed package the way it did before.
@@ -87,6 +143,9 @@ function App() {
     const fetchStatus = async () => {
       try {
         const res = await fetch('/api/auth/status')
+        // Any response at all means the backend process is alive.
+        heartbeatFails.current = 0
+        if (!cancelled) setBackendDown(false)
         if (!res.ok) return
         const data = await res.json()
         if (!cancelled) {
@@ -99,7 +158,12 @@ function App() {
           }
         }
       } catch {
-        if (!cancelled) setAuthStatus({ signedIn: false, loading: false })
+        // Fetch rejected — the backend is unreachable, not signed-out. Leave
+        // authStatus alone so a wake-up doesn't bounce through the sign-in
+        // gate; flip the sleep screen on after two consecutive misses.
+        heartbeatFails.current += 1
+        if (!cancelled && heartbeatFails.current >= 2) setBackendDown(true)
+        if (!cancelled) setAuthStatus((prev) => (prev.loading ? { signedIn: false, loading: false } : prev))
       }
     }
     fetchStatus()
@@ -997,6 +1061,35 @@ function App() {
 
   const activeResizeCursor = isResizing ? 'col-resize' : null
 
+  // Shown instead of the IDE (or the sign-in gate) when the backend process
+  // has died — the pane outlives the server, so its fetches start failing and
+  // the old behavior was to fall back to the sign-in page, which reads as
+  // "you were logged out" when the truth is "nothing is listening".
+  const renderBackendAsleep = () => (
+    <div className="signin-screen">
+      <div className="signin-card-custom">
+        <div className="signin-card-banner">
+          {/* With the backend dead this fetch can fail in the standalone
+              build (the pane build inlines it) — hide rather than show a
+              broken-image glyph. */}
+          <img
+            src="/vf_logo.png"
+            alt=""
+            className="signin-banner-logo"
+            onError={(e) => { e.currentTarget.style.display = 'none' }}
+          />
+          <div className="signin-banner-title">VibeFoundry</div>
+        </div>
+        <div className="signin-card-body">
+          <h2 className="signin-body-title">Backend has gone to sleep!</h2>
+          <p className="signin-body-msg">
+            Prompt your LLM to launch VibeFoundry again.
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+
   const renderSignInGate = () => (
     <div className="signin-screen">
       <div className="signin-card-custom">
@@ -1436,6 +1529,9 @@ function App() {
     </div>
   )
 
+  // A dead backend outranks every auth state — signed-in, skipped, or gated,
+  // nothing works until the server is relaunched.
+  if (backendDown) return renderBackendAsleep()
   if (skipAuth) return ideContent
   // Even the auth check gets the logo rather than a blank frame.
   if (authStatus.loading) return (

@@ -1,6 +1,0 @@
-Input Folder Metadata
-Folder: /Users/angelo/Documents/GitHub/vibefoundry-ide/frontend/input_folder
-Generated: 2026-02-17 10:06:02
-==================================================
-
-No data files found.

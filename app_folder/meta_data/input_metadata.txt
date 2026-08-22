@@ -1,6 +1,0 @@
-Input Folder Metadata
-Folder: /Users/angelobenedicto/Documents/GitHub/vibefoundry-ide/input_folder
-Generated: 2026-06-05 11:50:31
-==================================================
-
-No data files found.
