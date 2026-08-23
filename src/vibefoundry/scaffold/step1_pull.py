@@ -1,10 +1,13 @@
-from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pathlib import Path
+
+SCRIPT_FOLDER = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SCRIPT_FOLDER))
+
 from vf import pull
 
-pull(
-    sql="SELECT 1 AS replace_this_with_the_question",
-    into=Path(__file__).resolve().parent.parent / "raw_pulls" / "step1_pull.parquet",
-    script_name=Path(__file__).resolve().parent.parent.name,
-)
+SQL = "SELECT 1 AS replace_this_with_the_question"
+ORG = "pronghorn"
+DESTINATION = SCRIPT_FOLDER / "raw_pulls" / "step1_pull.parquet"
+
+pull(SQL, DESTINATION, org=ORG)

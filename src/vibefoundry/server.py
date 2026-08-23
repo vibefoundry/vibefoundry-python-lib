@@ -1578,7 +1578,13 @@ def _ensure_track0_files(paths: dict) -> dict:
     a folder whose puller is already there."""
     return {
         "vf_py": _copy_scaffold_file("vf.py", paths["folder"] / "vf.py"),
+        "app_py": _copy_scaffold_file("app.py", paths["folder"] / "app.py"),
         "step1_pull": _copy_scaffold_file("step1_pull.py", paths["steps"] / "step1_pull.py"),
+        # Without a step that writes final_output/ the answer never exists: the
+        # pull lands in raw_pulls/ and app.py stops. For a question whose SQL is
+        # already the answer this is a passthrough, and it is the file the model
+        # edits when the question needs real processing.
+        "step2_answer": _copy_scaffold_file("step2_answer.py", paths["steps"] / "step2_answer.py"),
     }
 
 
@@ -1667,11 +1673,6 @@ class OrgNotConnected(Exception):
         super().__init__(org_id)
         self.org_id = org_id
 
-
-def _not_connected_response(org_id: str) -> dict:
-    """The instant "call connect_organization" answer. Same wire shape the
-    plugin already handles for a lapsed credential, minus the browser."""
-    return {"status": "reauth_required", "org_id": org_id}
 
 
 def _orgs_store_path() -> Path:
@@ -1845,9 +1846,12 @@ def _gateway_json(res: httpx.Response) -> dict:
 def _require_org(org_id: str) -> dict:
     entry = _org_entry(org_id)
     if not entry:
-        # No stored credential is not a refused one: nothing to re-authenticate,
-        # so say so instead of opening a browser the caller did not ask for.
-        raise OrgNotConnected(org_id)
+        # Never-connected and expired are the same thing to someone who just
+        # asked a question about their data: there is no credential and a
+        # sign-in is owed. They used to be distinct, and because an expired
+        # credential is pruned on read, the never-connected branch — the one
+        # that gave up instead of signing in — was the one that fired.
+        raise OrgReauthRequired(org_id, None)
     return entry
 
 
@@ -1921,18 +1925,34 @@ def _hub_for_org(org_id: str, hub_url: Optional[str]) -> Optional[str]:
     return org["hub_url"] if org else None
 
 
-async def _reauth_response(org_id: str, hub_url: Optional[str] = None, host: str = "127.0.0.1:8765") -> dict:
-    """Re-authenticate instead of reporting. Merely returning "reconnect" costs
-    a model turn, and with a one-hour credential that is an hourly stumble — so
-    the credential is cleared and the browser opened here, and the caller polls
-    /api/org/status and retries its call once."""
+
+async def _signed_in_org(org_id: str, hub_url: Optional[str], host: str) -> dict:
+    """Open the organization's sign-in, wait for it, and return the credential.
+
+    This replaces returning a status for the caller to interpret. Handing back
+    "reauth_required" cost a model turn at best, and at worst produced "I can't
+    sign in for you" — a person being asked to fix something the machine was
+    holding the tools for."""
     hub = _hub_for_org(org_id, hub_url)
     _drop_org(org_id)
-    if not hub:
-        # A pasted hub whose entry is already gone: nothing to reopen.
-        return {"status": "reauth_required", "org_id": org_id}
-    started = await _start_org_connect(hub, host, key=org_id or hub, dedupe=True)
-    return {"status": "reauth_started", "org_id": org_id, **started}
+    # No hub known for this org — never connected on this machine, and the
+    # package ships no roster so a name alone cannot resolve one. That is what
+    # the picker is for: it lists the organizations and forwards to the right
+    # hub. Erroring here would make a first-ever connection impossible.
+    await _start_org_connect(hub, host, key=org_id or hub or CONNECT_URL, dedupe=True)
+    deadline = time.time() + ORG_SIGNIN_WAIT_SECONDS
+    while time.time() < deadline:
+        await asyncio.sleep(ORG_SIGNIN_POLL_SECONDS)
+        entry = _org_entry(org_id)
+        if entry:
+            return entry
+    raise HTTPException(
+        status_code=408,
+        detail=(
+            f"The sign-in for '{org_id}' is open in the browser and still "
+            "unfinished. Complete it and ask again."
+        ),
+    )
 
 
 # --- SQL guard rails ---------------------------------------------------------
@@ -2228,11 +2248,14 @@ async def org_connect(req: OrgConnectRequest, request: Request):
             raise HTTPException(status_code=400, detail=str(e))
         org_hint = org_hint_from_hub_url(hub_url)
     elif req.org_id:
+        # A named org that this package has never heard of is the normal case,
+        # not an error: the roster ships empty on purpose so no client is
+        # compiled in. The picker knows where every hub lives, so send the
+        # browser there rather than refusing a name we were never going to
+        # recognise.
         org = find_organization(req.org_id)
-        if not org:
-            raise HTTPException(status_code=404, detail=f"Unknown organization '{req.org_id}'")
-        hub_url = org["hub_url"]
-        org_hint = org["id"]
+        hub_url = org["hub_url"] if org else None
+        org_hint = org["id"] if org else req.org_id
     else:
         # No org named and no hub pasted: send the browser to the picker, which
         # lists the organizations and forwards to whichever hub the user picks.
@@ -2395,16 +2418,13 @@ async def org_catalog(request: Request):
             "columns": columns,
         })
 
-    # `reauth_org_ids`, not `reauth_required`: the update below can set
-    # top-level `status` to the string "reauth_required", and one key must not
-    # mean both "the signal" and "the list of orgs it applies to".
-    result = {"tables": tables, "errors": errors, "reauth_org_ids": reauth, "status": "ok"}
     if reauth:
-        # The tables that did load are still returned alongside: the caller
-        # retries the whole catalogue once the browser round trip lands, and a
-        # frontend that only reads `tables` keeps working meanwhile.
-        result.update(await _reauth_response(reauth[0], reauth_hub, _callback_host(request)))
-    return result
+        # Sign in and rebuild rather than hand back a list with a hole in it and
+        # a status the caller has to act on. The orgs that loaded are re-listed
+        # by the retry, so nothing is lost by waiting for the sign-in here.
+        await _signed_in_org(reauth[0], reauth_hub, _callback_host(request))
+        return await org_catalog(request)
+    return {"tables": tables, "errors": errors, "status": "ok"}
 
 
 @app.get("/api/org/schema/{org_id}/{table_id}")
@@ -2431,15 +2451,80 @@ async def org_schema(org_id: str, table_id: str, request: Request):
         entry = _require_org(org_id)
         res = await _gateway_request(entry, "GET", f"/v1/tables/{table_id}/schema")
         payload = _gateway_json(res)
-    except OrgNotConnected as e:
-        return _not_connected_response(e.org_id)
-    except OrgReauthRequired as e:
-        return await _reauth_response(e.org_id, e.hub_url, _callback_host(request))
+    except (OrgNotConnected, OrgReauthRequired) as e:
+        entry = await _signed_in_org(e.org_id, getattr(e, "hub_url", None), _callback_host(request))
+        res = await _gateway_request(entry, "GET", f"/v1/tables/{table_id}/schema")
+        payload = _gateway_json(res)
     return {"source": "org", "org_id": org_id, **payload}
+
+
+_SELECT_STAR = re.compile(r"select\s+\*", re.IGNORECASE)
+
+
+def _write_pull_step(paths: dict, org_id: str, sql: str, filename: str) -> Path:
+    """Write steps/step1_pull.py from the skeleton, carrying this SQL.
+
+    The model supplies SQL; it does not author the file. That is the whole
+    point: a hand-written pull step is how a cut ended up in input_folder/ and
+    how a puller could be invented per folder."""
+    skeleton = (Path(__file__).parent / "scaffold" / "step1_pull.py").read_text(encoding="utf-8")
+    out = []
+    for line in skeleton.split("\n"):
+        if line.startswith("SQL = "):
+            out.append(f"SQL = {json.dumps(sql)}")
+        elif line.startswith("ORG = "):
+            out.append(f"ORG = {json.dumps(org_id)}")
+        elif line.startswith("DESTINATION = "):
+            out.append(f'DESTINATION = SCRIPT_FOLDER / "raw_pulls" / {json.dumps(filename)}')
+        else:
+            out.append(line)
+    dest = paths["steps"] / "step1_pull.py"
+    dest.write_text("\n".join(out), encoding="utf-8")
+    return dest
+
+
+def _final_output(paths: dict) -> dict:
+    """What the script produced. The answer is read out of the file rather than
+    from rows glimpsed on the way past, so the file and the answer cannot
+    disagree."""
+    folder = paths["final_output"]
+    files = sorted(f for f in folder.glob("*") if f.is_file())
+    preview, columns, rows = None, [], 0
+    for f in files:
+        if f.suffix == ".parquet":
+            frame = pl.read_parquet(f)
+            columns, rows = frame.columns, frame.height
+            preview = [[_json_scalar(v) for v in row] for row in frame.head(50).rows()]
+            break
+    return {
+        "files": [str(f) for f in files],
+        "columns": columns,
+        "rows": preview or [],
+        "row_count": rows,
+        "truncated": rows > 50,
+    }
 
 
 @app.post("/api/org/query")
 async def org_query(req: OrgQueryRequest, request: Request):
+    """Run SQL and return rows. Nothing is written and nothing is run.
+
+    This is what steps/step1_pull.py calls, so it must NOT be the endpoint that
+    builds and runs a script: that recursed — answer ran app.py, app.py ran
+    step1_pull.py, step1_pull.py called back here — until the script timed out.
+    Building is /api/org/answer; this is the fetch underneath it."""
+    if req.org_id == PUBLIC_ORG_ID:
+        return await _run_public_sql(req.sql, req.limit, req.script_name)
+    try:
+        entry = _require_org(req.org_id)
+        return await _run_org_sql(entry, req.sql, req.limit, req.script_name)
+    except (OrgNotConnected, OrgReauthRequired) as e:
+        entry = await _signed_in_org(e.org_id, getattr(e, "hub_url", None), _callback_host(request))
+        return await _run_org_sql(entry, req.sql, req.limit, req.script_name)
+
+
+@app.post("/api/org/answer")
+async def org_answer(req: OrgQueryRequest, request: Request):
     """Answer a question with SQL, at the gateway for an org and locally for
     public data. This is the path that means a question costs a few hundred
     rows rather than a whole-table download.
@@ -2447,17 +2532,41 @@ async def org_query(req: OrgQueryRequest, request: Request):
     A named `script_name` is resolved before any SQL runs - same policy as
     /api/org/pull: an unusable name is the caller's 400 at the door, never a
     result quietly redirected somewhere else after the work is done."""
-    if req.script_name:
-        _script_folders(req.script_name)
-    if req.org_id == PUBLIC_ORG_ID:
-        return await _run_public_sql(req.sql, req.limit, req.script_name)
-    try:
-        entry = _require_org(req.org_id)
-        return await _run_org_sql(entry, req.sql, req.limit, req.script_name)
-    except OrgNotConnected as e:
-        return _not_connected_response(e.org_id)
-    except OrgReauthRequired as e:
-        return await _reauth_response(e.org_id, e.hub_url, _callback_host(request))
+    if not req.script_name:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "script_name is required: a question builds a script. Without it "
+                "the cut has no folder to belong to and lands in input_folder/, "
+                "which is for apps, not answers."
+            ),
+        )
+    if _SELECT_STAR.search(req.sql):
+        raise HTTPException(
+            status_code=400,
+            detail="Name the columns instead of SELECT * — a whole table is not an answer.",
+        )
+    body = req.sql.strip().rstrip(";")
+    if ";" in body:
+        raise HTTPException(status_code=400, detail="One statement per query.")
+    if not re.match(r"^\s*(select|with)\b", body, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="Only SELECT (or WITH) may be run.")
+
+    paths = _script_folders(req.script_name)
+    _ensure_track0_files(paths)
+    _write_pull_step(paths, req.org_id, body, f"{req.script_name}.parquet")
+
+    app_py = paths["folder"] / "app.py"
+    outcome = await asyncio.to_thread(run_script, app_py, state.project_folder)
+    if not outcome.success:
+        detail = (outcome.error or outcome.stderr or outcome.stdout or "").strip()
+        raise HTTPException(status_code=400, detail=f"The script failed:\n{detail[-1500:]}")
+    return {
+        "status": "ok",
+        "script_name": req.script_name,
+        "folder": str(paths["folder"]),
+        **_final_output(paths),
+    }
 
 
 @app.post("/api/org/pull")
@@ -2509,10 +2618,15 @@ async def org_pull(req: OrgPullRequest, request: Request):
         else:
             res = await _gateway_request(entry, "GET", f"/v1/tables/{req.table_id}")
             default_name = f"{req.table_id}.parquet"
-    except OrgNotConnected as e:
-        return _not_connected_response(e.org_id)
-    except OrgReauthRequired as e:
-        return await _reauth_response(e.org_id, e.hub_url, _callback_host(request))
+    except (OrgNotConnected, OrgReauthRequired) as e:
+        entry = await _signed_in_org(e.org_id, getattr(e, "hub_url", None), _callback_host(request))
+        if req.sql:
+            body = {"sql": req.sql, "format": "parquet"}
+            res = await _gateway_request(entry, "POST", "/v1/query", json_body=body)
+            default_name = f"{req.table_id or 'query'}_cut.parquet"
+        else:
+            res = await _gateway_request(entry, "GET", f"/v1/tables/{req.table_id}")
+            default_name = f"{req.table_id}.parquet"
 
     _raise_for_gateway_error(res)
 
