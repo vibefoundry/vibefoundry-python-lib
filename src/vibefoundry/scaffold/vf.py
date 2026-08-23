@@ -248,20 +248,57 @@ def _backend_query(port: int, org: str, sql: str, script_name) -> pl.DataFrame:
     url = f"http://127.0.0.1:{port}/api/org/query"
     payload = {"org_id": org, "sql": sql, "script_name": script_name}
     result = _backend_call(url, payload)
-    if result.get("status") == "reauth_started":
-        # The backend already cleared the refused credential and opened the
-        # browser; there is no handshake to implement here, only a wait.
+
+    # Two different "no credential" answers, and they need different first moves.
+    # reauth_started: the backend refused an existing credential, cleared it and
+    # already opened the browser — only a wait is owed. reauth_required: this
+    # machine has never connected, so nothing has been opened and asking for the
+    # sign-in is this script's job. Without that second branch, running a script
+    # on a fresh machine errored instead of signing the user in, which defeats
+    # the point of the pull living in the script at all.
+    if result.get("status") == "reauth_required":
+        if not _open_sign_in(port, org):
+            raise RuntimeError(
+                f"'{org}' is not connected on this machine, and VibeFoundry could not "
+                "open its sign-in page. Connect it from the Organizations panel and rerun."
+            )
+        if not _wait_for_org(port, org):
+            raise RuntimeError(
+                f"the sign-in for '{org}' is open in the browser and still unfinished — "
+                "complete it and rerun"
+            )
+        result = _backend_call(url, payload)
+    elif result.get("status") == "reauth_started":
         if not _wait_for_org(port, org):
             raise RuntimeError(
                 f"the sign-in for '{org}' is still waiting in the browser — finish it and rerun"
             )
         result = _backend_call(url, payload)
+
     status = result.get("status")
     if status and status != "ok":
         raise RuntimeError(
             f"VibeFoundry could not query '{org}' ({status}) — connect the organization and rerun"
         )
     return _frame(result)
+
+
+def _open_sign_in(port: int, org: str) -> bool:
+    """Ask the backend to open this organization's sign-in page. The backend
+    owns the nonce, the browser and the callback — the same call the
+    Organizations panel makes — so nothing here touches a credential."""
+    try:
+        answer = json.loads(
+            _request(
+                f"http://127.0.0.1:{port}/api/org/connect",
+                "POST",
+                {"org_id": org},
+                timeout=60,
+            )
+        )
+    except Exception:
+        return False
+    return answer.get("status") in ("opened", "ok")
 
 
 def _backend_call(url: str, payload: dict) -> dict:
