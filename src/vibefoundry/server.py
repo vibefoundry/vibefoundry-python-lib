@@ -87,6 +87,7 @@ from vibefoundry.runner import discover_scripts, run_script, setup_project_struc
 from vibefoundry.metadata import generate_metadata
 from vibefoundry.watcher import FileWatcher
 from vibefoundry.organizations import (
+    CONNECT_URL,
     ORGANIZATIONS, PUBLIC_ORG_ID, PUBLIC_ORG_NAME,
     find_organization, normalize_hub_url, normalize_gateway_url, org_hint_from_hub_url,
 )
@@ -1887,10 +1888,13 @@ async def _start_org_connect(
 
     nonce = secrets.token_urlsafe(32)
     _pending_org_states[nonce] = {"hub_url": hub_url, "expires": time.time() + _ORG_STATE_TTL_SECONDS}
+    # hub_url is None when the picker chooses: the callback carries org_id,
+    # gateway and the credential, so the hub is discovered rather than declared.
 
     callback_url = f"http://{host}/org/callback"
+    base = f"{hub_url}/connect" if hub_url else CONNECT_URL
     connect_url = (
-        f"{hub_url}/connect"
+        f"{base}"
         f"?state={nonce}"
         f"&callback={urllib.parse.quote(callback_url, safe='')}"
     )
@@ -2230,7 +2234,12 @@ async def org_connect(req: OrgConnectRequest, request: Request):
         hub_url = org["hub_url"]
         org_hint = org["id"]
     else:
-        raise HTTPException(status_code=400, detail="Supply an org_id or a hub_url")
+        # No org named and no hub pasted: send the browser to the picker, which
+        # lists the organizations and forwards to whichever hub the user picks.
+        # The hub identifies itself on the way back, so nothing here has to know
+        # which organizations exist — that is why this package ships no roster.
+        hub_url = None
+        org_hint = "pending"
 
     started = await _start_org_connect(hub_url, _callback_host(request), key=org_hint or hub_url)
     return {"status": "opened", "org_id": org_hint, **started}

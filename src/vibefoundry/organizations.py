@@ -13,14 +13,19 @@ hub URL and `normalize_hub_url` turns it into the same shape.
 import urllib.parse
 from typing import Optional
 
-ORGANIZATIONS = [
-    {
-        "id": "pronghorn",
-        "name": "Pronghorn",
-        "hub_url": "https://hub.vibefoundry.ai",
-        "logo": None,
-    },
-]
+# Where a connection starts when the user has not named a hub. This page lists
+# the organizations and hands the browser to whichever one they pick; the hub
+# then authenticates them against ITS OWN identity provider and redirects the
+# credential straight back to this machine. Nothing about which organizations
+# exist is compiled in here, so onboarding a client is a change to that page,
+# not a release of this package.
+CONNECT_URL = "https://vibefoundry.ai/connect"
+
+# Deliberately empty. A hardcoded roster meant every new client needed a package
+# release, and it named one client in the source of a product meant to serve
+# many. A user who knows their hub address can still paste it (see
+# `normalize_hub_url`); everyone else goes through CONNECT_URL.
+ORGANIZATIONS = []
 
 # The public data library is not an organization — it has no hub and no
 # credential — but every catalogue and query path addresses it by the same
