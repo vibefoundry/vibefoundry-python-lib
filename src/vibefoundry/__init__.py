@@ -2,7 +2,7 @@
 VibeFoundry IDE - A local IDE for data science workflows
 """
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 __all__ = ["main"]
 
 from vibefoundry.cli import main

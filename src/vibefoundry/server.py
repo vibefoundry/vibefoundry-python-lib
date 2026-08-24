@@ -20,6 +20,7 @@ from pathlib import Path
 # so a partially-initialized package still resolves it.
 from vibefoundry import __version__
 from vibefoundry import xlsx_view
+from vibefoundry import portal
 
 # Honor the OS-native trust store (Windows cert store, macOS Keychain) so
 # corporate TLS-inspecting proxies — which re-sign traffic with an internal
@@ -684,6 +685,161 @@ async def auth_status():
         "user": {"sub": record.get("sub"), "email": record.get("email")},
         "expiresAt": record.get("expiresAt"),
     }
+
+
+# --- the client portal ---------------------------------------------------------
+#
+# Asking a portal a question needs two different sign-ins, and keeping them
+# apart is what makes the failures legible. VibeFoundry (Clerk) says which
+# client portals this account may reach; the client's own portal (Google IAP)
+# says a person is present right now. The first is long-lived and the second
+# is not - an hour - so "sign in again" is an ordinary event here, not an error.
+
+_pending_portal_states: dict[str, float] = {}
+
+
+@app.get("/api/portal/status")
+async def portal_status():
+    """Where this project stands: bound to a client, and signed in or not.
+
+    Deliberately answers rather than refuses. A caller needs to know which of
+    the three steps is outstanding, and a 401 cannot say which.
+    """
+    folder = state.project_folder
+    if not folder:
+        return {"ready": False, "needs": "open_project"}
+
+    bound = portal.project_hub(folder)
+    if not bound:
+        stored = _read_stored_token()
+        if not stored:
+            return {"ready": False, "needs": "vibefoundry_signin"}
+        try:
+            orgs = portal.org_hubs(stored.get("token", ""))
+        except portal.PortalError as problem:
+            return {"ready": False, "needs": problem.needs or "vibefoundry_signin",
+                    "message": str(problem)}
+        return {"ready": False, "needs": "pick_org", "orgs": orgs}
+
+    live = portal.session(bound["hub"])
+    if not live:
+        return {"ready": False, "needs": "portal_signin", "org": bound}
+    return {
+        "ready": True,
+        "org": bound,
+        "viewer": live.get("email", ""),
+        "expires": live.get("expires", 0),
+    }
+
+
+class PortalBindRequest(BaseModel):
+    id: str = ""
+    name: str = ""
+    hub: str
+
+
+@app.post("/api/portal/bind")
+async def portal_bind(request: PortalBindRequest):
+    """Remember which client's portal this folder belongs to."""
+    if not state.project_folder:
+        raise HTTPException(status_code=400, detail="No project is open.")
+    if not request.hub.startswith("https://"):
+        raise HTTPException(status_code=400, detail="A portal address must be https.")
+    return {"org": portal.bind_project(state.project_folder, request.model_dump())}
+
+
+@app.post("/api/portal/signin/start")
+async def portal_signin_start(http: Request):
+    """The URL the browser opens to turn a portal session into a token."""
+    if not state.project_folder:
+        raise HTTPException(status_code=400, detail="No project is open.")
+    bound = portal.project_hub(state.project_folder)
+    if not bound:
+        raise HTTPException(status_code=400, detail="This project is not connected to an organization yet.")
+
+    now = time.time()
+    for nonce, expiry in list(_pending_portal_states.items()):
+        if expiry < now:
+            _pending_portal_states.pop(nonce, None)
+    nonce = secrets.token_urlsafe(32)
+    _pending_portal_states[nonce] = now + _AUTH_STATE_TTL_SECONDS
+
+    host = http.headers.get("host", "127.0.0.1:8765")
+    callback = f"http://{host}/portal/callback"
+    return {"url": portal.sign_in_url(bound["hub"], callback, nonce), "org": bound}
+
+
+@app.get("/portal/callback")
+async def portal_callback(token: str = "", gateway: str = "", email: str = "",
+                          expires: int = 0, state_: str = Query("", alias="state")):
+    """Receives the redirect from the portal, holding a fresh assertion.
+
+    The portal only ever redirects a token to a loopback address, so arriving
+    here means it came back to the machine that asked for it.
+    """
+    if not token or not state_:
+        return HTMLResponse(_auth_callback_html(error="Missing token or state."), status_code=400)
+    if state_ not in _pending_portal_states:
+        return HTMLResponse(
+            _auth_callback_html(error="Invalid or expired sign-in attempt. Try again from the IDE."),
+            status_code=400,
+        )
+    _pending_portal_states.pop(state_, None)
+
+    bound = portal.project_hub(state.project_folder) if state.project_folder else None
+    if not bound:
+        return HTMLResponse(_auth_callback_html(error="This project is not connected to an organization."), status_code=400)
+
+    portal.save_token(bound["hub"], token, gateway, email, expires)
+    return HTMLResponse(_auth_callback_html())
+
+
+def _portal_session() -> dict:
+    """The live session for the open project, or the reason there is not one."""
+    folder = state.project_folder
+    if not folder:
+        raise HTTPException(status_code=400, detail="No project is open.")
+    bound = portal.project_hub(folder)
+    if not bound:
+        raise HTTPException(status_code=409, detail="This project is not connected to an organization yet.")
+    live = portal.session(bound["hub"])
+    if not live:
+        raise HTTPException(status_code=401, detail=f"Sign in to the {bound.get('name') or 'portal'} portal.")
+    return live
+
+
+@app.get("/api/portal/tables")
+async def portal_tables():
+    """What this person may read, and what is in it."""
+    live = _portal_session()
+    try:
+        return {"tables": await asyncio.to_thread(portal.tables, live)}
+    except portal.PortalError as problem:
+        raise HTTPException(status_code=401 if problem.needs else 502, detail=str(problem))
+
+
+@app.get("/api/portal/tables/{table_id}/schema")
+async def portal_schema(table_id: str):
+    live = _portal_session()
+    try:
+        return await asyncio.to_thread(portal.schema, live, table_id)
+    except portal.PortalError as problem:
+        raise HTTPException(status_code=401 if problem.needs else 502, detail=str(problem))
+
+
+class PortalQueryRequest(BaseModel):
+    sql: str
+    limit: Optional[int] = None
+
+
+@app.post("/api/portal/query")
+async def portal_query(request: PortalQueryRequest):
+    """Ask the portal a question. Rows come back; the table stays there."""
+    live = _portal_session()
+    try:
+        return await asyncio.to_thread(portal.query, live, request.sql, request.limit)
+    except portal.PortalError as problem:
+        raise HTTPException(status_code=401 if problem.needs else 400, detail=str(problem))
 
 
 @app.post("/api/auth/sign-out")
